@@ -1,17 +1,239 @@
--- NpcSquareSystem (combat subsystem upgrade)
--- This block is designed to be pasted directly inside your main script,
--- so combat and AI can run from one script only.
+-- NpcSquareSystem (ServerScript inside ServerScriptService)
+-- FULL WORKING VERSION (UPDATED + YOUR 3 REQUESTED SERVER-SIDE FIXES)
 --
--- Usage inside main script:
--- 1) Keep this whole block above your soldier update loop.
--- 2) Create combat data once per soldier clone:
---      local combatAnim = setupSoldierCombatAnimations(clone)
--- 3) Replace normal chase movement with:
---      local moved = updateCloseCombat(clone, combatAnim, target.hrp.Position, dt, stats.Speed)
+-- ✅ FIX A (FOLLOW ASSIST):
+--    Follow soldiers now assist when you HIT or GET HIT even if your weapon does NOT set creator tags.
 --
--- Optional module compatibility:
--- If this code is left in a ModuleScript and required, it will still return
--- the same API table at the bottom.
+-- ✅ FIX B (BASE DEFEND RE-AGGRO BUG):
+--    Base intrusion hostility is now "touch-hostility" that clears when intruder leaves the base area.
+--
+-- ✅ NEW FIX 1 (ATTACK PRIORITY):
+--    Enemy SOLDIERS are targeted first, then enemy players.
+--
+-- ✅ NEW FIX 2 (CHASE LONGER):
+--    Soldiers keep chasing targets longer using chase-memory with a leash.
+--
+-- ✅ USER FIX 1 (CONQUER SPREAD):
+--    Conquer mode soldiers expand outward in a radial arc from the base instead of
+--    rushing straight forward. Squares are scored by angle-from-base + distance,
+--    giving natural spreading behaviour.
+--
+-- ✅ USER FIX 2 (CONQUER SELF-DEFENCE):
+--    Conquer-mode soldiers now actively defend themselves against ANY hostile,
+--    not only after being directly hit.
+--
+-- ✅ USER FIX 3 (DEATH / RESPAWN TIMER):
+--    When a soldier's humanoid dies the body lingers for a few seconds then despawns.
+--    A countdown ("Respawn in Xs") appears in the NPC's BillboardGui inside
+--    the Places folder.  After the delay a completely fresh soldier spawns
+--    (no memory of previous targets/hostility).
+--    Respawn time scales with level (level 1 = longest, level 8 = shortest).
+--
+-- ✅ USER FIX 4 (FOLLOW SELF-DEFENCE):
+--    Follow-mode soldiers now fight back immediately when an enemy soldier attacks them
+--    or their owner. Hostility is also set at the SOLDIER level (not just player level)
+--    so the retaliation triggers correctly.
+--
+-- ✅ USER FIX 5 (TIGHTER PROXIMITY ASSIST):
+--    The radius at which follow soldiers start helping their owner in a fight has been
+--    reduced so they only engage when they are meaningfully close to the player,
+--    preventing far-away soldiers from chain-aggroing across the map.
+
+local TweenService      = game:GetService("TweenService")
+local Players           = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService        = game:GetService("RunService")
+
+local DEBUG_LEVEL = false
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- REFERENCES
+-- ─────────────────────────────────────────────────────────────────────────────
+local npcFolder      = ReplicatedStorage:WaitForChild("AllNpcs")
+local soldiersFolder = ReplicatedStorage:WaitForChild("NpcsSoliders")
+local mapFolder      = workspace:WaitForChild("Map")
+local squaresFolder  = mapFolder:WaitForChild("Squares")
+local basesFolder    = workspace:WaitForChild("Bases")
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- REMOTE EVENTS
+-- ─────────────────────────────────────────────────────────────────────────────
+local SendFeedbackEvent = ReplicatedStorage:FindFirstChild("SendFeedbackEvent") or Instance.new("RemoteEvent")
+SendFeedbackEvent.Name   = "SendFeedbackEvent"
+SendFeedbackEvent.Parent = ReplicatedStorage
+
+local SoldierCommandEvent = ReplicatedStorage:FindFirstChild("SoldierCommandEvent") or Instance.new("RemoteEvent")
+SoldierCommandEvent.Name   = "SoldierCommandEvent"
+SoldierCommandEvent.Parent = ReplicatedStorage
+
+local CombatTagEvent = ReplicatedStorage:FindFirstChild("CombatTagEvent")
+if not CombatTagEvent then
+	CombatTagEvent = Instance.new("BindableEvent")
+	CombatTagEvent.Name = "CombatTagEvent"
+	CombatTagEvent.Parent = ReplicatedStorage
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- CONSTANTS (BASE STATS)
+-- ─────────────────────────────────────────────────────────────────────────────
+local CONQUEST_RADIUS          = 15
+local CONQUEST_TIME            = 4
+local SOLDIER_SPEED            = 5
+local NPC_SPAWN_INTERVAL       = 3.5
+local SOLDIER_RESPAWN_INTERVAL = 8
+
+local WALK_ANIM_ID          = "rbxassetid://122997532503782"
+local CONQUER_ANIM_ID       = "rbxassetid://111649779880582"
+local SOLDIER_IDLE_ANIM_ID  = "rbxassetid://104270859363826"
+
+-- ATTACK (BASE)
+local ALERT_ANIM_ID         = "rbxassetid://130829548132060"
+local PUNCH_ANIM_ID         = "rbxassetid://125672823778416"
+local ATTACK_AGGRO_RADIUS   = 55
+local ATTACK_PUNCH_RANGE    = 4.2
+local ATTACK_DAMAGE         = 12
+local ATTACK_COOLDOWN       = 0.85
+local PUNCH_WINDUP          = 0.16
+local PUNCH_RECOVER         = 0.10
+local ATTACK_FOV_DEGREES    = 120
+local ATTACK_FACE_ASSIST    = true
+
+-- DEFEND
+local DEFEND_RING_MIN       = 12
+local DEFEND_RING_MAX       = 26
+local DEFEND_MAX_DISTANCE   = 40
+local DEFEND_ARRIVE_RADIUS  = 2.0
+local DEFEND_IDLE_TIME      = 2.0
+
+-- FOLLOW
+local FOLLOW_TOO_FAR        = 18
+local FOLLOW_COMFORT_MIN    = 7
+local FOLLOW_COMFORT_MAX    = 14
+local FOLLOW_PATROL_MIN     = 8
+local FOLLOW_PATROL_MAX     = 18
+local FOLLOW_MIN_PAUSE      = 0.9
+local FOLLOW_MAX_PAUSE      = 2.2
+local FOLLOW_PREDICT_SEC    = 0.35
+
+-- ✅ USER FIX 5: How close the soldier must be to its owner before it will assist
+-- in a fight. Lowered from the old implicit "anywhere in aggro radius" to a hard
+-- proximity cap so distant soldiers don't chain-aggro.
+-- Old effective value: stats.AggroRadius (~55–85 studs)
+-- New value: 28 studs — the soldier must already be near you to join in.
+local FOLLOW_ASSIST_PROXIMITY = 22
+
+-- Leader idle fallback
+local LEADER_IDLE_FALLBACK_ANIM_ID = "rbxassetid://130797235347873"
+
+-- Wild leader despawn
+local WILD_LEADER_DESPAWN_TIME  = 30
+local WILD_SQUARE_LOCK_SECONDS  = 0.8
+local SOLDIER_FALL_Y_KILL       = -50
+
+-- STARTER HELP
+local BASE_HELP_ONLY_IF_LEADERS_LE   = 2
+local BASE_HELP_MAX_ACTIVE_PER_OWNER = 2
+local BASE_HELP_COOLDOWN_SECONDS     = 35
+local BASE_HELP_CHECK_INTERVAL       = 6.0
+
+-- spawn bias tuning
+local NEAR_BASE_RADIUS_STUDS        = 85
+local COMMON_RARE_NEARBASE_CHANCE   = 0.72
+
+-- hostility / combat memory
+local HOSTILE_TOUCH_DURATION  = 12
+local HOSTILE_COMBAT_DURATION = 14
+local FOLLOW_ASSIST_MEMORY    = 10
+
+-- conquer self defense window after being hit
+local CONQUER_SELF_DEFEND_SECONDS = 5.0
+
+-- stuck nudge
+local STUCK_MIN_MOVE = 0.03
+local STUCK_TIME     = 1.2
+
+-- FIX B: touch-hostility clears when intruder leaves area
+local INTRUSION_CLEAR_RADIUS   = 75
+local INTRUSION_CHECK_INTERVAL = 0.5
+
+-- FIX A: follow assist fallback when no creator tag
+local FALLBACK_NEAR_ATTACKER_RADIUS = 22
+
+-- NEW FIX 2: chase improvements
+local CHASE_MEMORY_SECONDS   = 10
+local CHASE_MAX_EXTRA_DIST   = 35
+local DEFEND_CHASE_LEASH     = 85
+local FOLLOW_CHASE_LEASH     = 120
+
+-- ✅ USER FIX 1: conquer spread tuning
+local CONQUER_SPREAD_DISTANCE_WEIGHT = 1.0
+local CONQUER_SPREAD_ANGLE_WEIGHT    = 0.30
+local CONQUER_SPREAD_ANGLE_IDEAL_DEG = 45
+local CONQUER_SPREAD_NOISE           = 5
+
+-- ✅ USER FIX 3: respawn times per level (seconds)
+local RESPAWN_TIME_BY_LEVEL = {
+	[1] = 30,
+	[2] = 27,
+	[3] = 24,
+	[4] = 21,
+	[5] = 18,
+	[6] = 15,
+	[7] = 12,
+	[8] = 9,
+}
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- STATE
+-- ─────────────────────────────────────────────────────────────────────────────
+local rarityFoldersCache    = {}
+local npcCostCache          = {}
+
+local squareList            = {}
+local squareOwners          = {}
+local conquestTimers        = {}
+local playerSpawnCache      = {}
+local occupiedSquares       = {}
+local squareGuiCache        = {}
+local squareReservations    = {}
+
+local playerSoldiers        = {}
+local soldierManagerStarted = {}
+
+local playerSoldierModes = {}
+local playerAttackTarget = {}
+
+local legendaryTime          = 270
+local mythicTime             = 870
+local legendaryCountdown     = legendaryTime
+local mythicCountdown        = mythicTime
+local lastLegendaryCountdown = -1
+local lastMythicCountdown    = -1
+
+local baseSquareList     = {}
+local baseSquareToBase   = {}
+local baseCenters        = {}
+
+local baseHelpCooldownUntil = {}
+
+local mapNeighbors       = {}
+local baseAdjMapSquares  = {}
+
+local hostileCombatUntil = {}
+local hostileTouchUntil  = {}
+local followFocusUntil   = {}
+
+local ownerBaseCenter    = {}
+
+-- ✅ USER FIX 3: tracks which slots are currently in respawn countdown
+local soldierRespawning  = {}
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- HELPERS
+-- ─────────────────────────────────────────────────────────────────────────────
+local function sendPlayerFeedback(player, message, isError)
+	SendFeedbackEvent:FireClient(player, message, isError)
+end
 
 local function normalizeAnimId(id)
 	if not id then return nil end
@@ -29,150 +251,2343 @@ local function distXZ(a, b)
 	return math.sqrt(dx*dx + dz*dz)
 end
 
-local function moveToward(model, currentPos, targetPos, dt, speed)
+local function stepTowardPivot(model, currentPos, targetPos, dt, speedOverride)
 	local dir = Vector3.new(targetPos.X - currentPos.X, 0, targetPos.Z - currentPos.Z)
-	if dir.Magnitude < 0.01 then return false end
-	local step = math.min(dir.Magnitude, speed * dt)
-	local newPos = currentPos + dir.Unit * step
-	model:PivotTo(CFrame.lookAt(newPos, newPos + dir.Unit))
-	return true
+	if dir.Magnitude > 0.35 then
+		local speed = speedOverride or SOLDIER_SPEED
+		local step   = math.min(dir.Magnitude, speed * dt)
+		local newPos = currentPos + dir.Unit * step
+		model:PivotTo(CFrame.lookAt(newPos, newPos + dir.Unit))
+		return true
+	end
+	return false
 end
 
--- New combat move animations
-local DASH_FORWARD_ANIM_ID  = "rbxassetid://102943968856482"
-local DASH_BACK_ANIM_ID     = "rbxassetid://111268221240880"
-local DASH_LEFT_ANIM_ID     = "rbxassetid://117664259628631"
-local DASH_RIGHT_ANIM_ID    = "rbxassetid://132386621141954"
-local FIGHT_STANCE_ANIM_ID  = "rbxassetid://0" -- optional; only used if set to a valid asset id
-
--- Combat movement tuning
-local FIGHT_STANCE_RADIUS   = 9.0
-local DASH_TRIGGER_RADIUS   = 8.0
-local DASH_DISTANCE_MIN     = 2.8
-local DASH_DISTANCE_MAX     = 5.6
-local DASH_COOLDOWN_MIN     = 0.45
-local DASH_COOLDOWN_MAX     = 1.05
-local DASH_SPEED_MULT       = 2.4
-
-local function loadTrack(animator, animId, looped, priority)
-	animId = normalizeAnimId(animId)
-	if not animId then return nil end
-	local anim = Instance.new("Animation")
-	anim.AnimationId = animId
-	local ok, track = pcall(function() return animator:LoadAnimation(anim) end)
-	if not ok or not track then return nil end
-	track.Looped = looped
-	track.Priority = priority
-	return track
+local function captureOriginalTransparency(model)
+	local t = {}
+	for _, d in ipairs(model:GetDescendants()) do
+		if d:IsA("BasePart") then
+			t[d] = d.Transparency
+			d.LocalTransparencyModifier = 0
+		end
+	end
+	return t
 end
 
-function setupSoldierCombatAnimations(model)
-	local humanoid = model:FindFirstChildOfClass("Humanoid")
-	if not humanoid then return nil end
-	local animator = humanoid:FindFirstChildOfClass("Animator") or Instance.new("Animator", humanoid)
-
-	local stanceTrack = loadTrack(animator, FIGHT_STANCE_ANIM_ID, true, Enum.AnimationPriority.Action)
-	local dashTracks = {
-		Forward = loadTrack(animator, DASH_FORWARD_ANIM_ID, false, Enum.AnimationPriority.Action),
-		Back = loadTrack(animator, DASH_BACK_ANIM_ID, false, Enum.AnimationPriority.Action),
-		Left = loadTrack(animator, DASH_LEFT_ANIM_ID, false, Enum.AnimationPriority.Action),
-		Right = loadTrack(animator, DASH_RIGHT_ANIM_ID, false, Enum.AnimationPriority.Action),
-	}
-
-	return {
-		stanceTrack = stanceTrack,
-		dashTracks = dashTracks,
-		inStance = false,
-		lastDashAt = 0,
-		nextDashDelay = math.random() * (DASH_COOLDOWN_MAX - DASH_COOLDOWN_MIN) + DASH_COOLDOWN_MIN,
-	}
-end
-
-local function setFightStance(combatAnim, on)
-	if not combatAnim then return end
-	if combatAnim.inStance == on then return end
-	combatAnim.inStance = on
-	if combatAnim.stanceTrack then
-		if on then
-			if not combatAnim.stanceTrack.IsPlaying then
-				pcall(function() combatAnim.stanceTrack:Play(0.12, 1, 1) end)
-			end
-		else
-			if combatAnim.stanceTrack.IsPlaying then
-				pcall(function() combatAnim.stanceTrack:Stop(0.1) end)
+local function restoreVisibility(model, originalMap)
+	for part, orig in pairs(originalMap) do
+		if part and part.Parent and part:IsA("BasePart") then
+			part.LocalTransparencyModifier = 0
+			if part.Transparency >= 1 and (orig or 0) < 1 then
+				part.Transparency = orig or 0
 			end
 		end
 	end
 end
 
-local function chooseDashDirection(distanceToTarget)
-	if distanceToTarget <= 3.2 then
-		return "Back"
+local function setModelAnchored(model, anchored)
+	for _, d in ipairs(model:GetDescendants()) do
+		if d:IsA("BasePart") then
+			d.Anchored = anchored
+		end
 	end
-	local roll = math.random()
-	if roll < 0.35 then return "Forward" end
-	if roll < 0.58 then return "Left" end
-	if roll < 0.81 then return "Right" end
-	return "Back"
 end
 
-local function performDash(model, combatAnim, targetPos, dt, speed)
-	if not combatAnim then return false end
+local function zeroModelVelocity(model)
+	for _, d in ipairs(model:GetDescendants()) do
+		if d:IsA("BasePart") then
+			d.AssemblyLinearVelocity  = Vector3.zero
+			d.AssemblyAngularVelocity = Vector3.zero
+		end
+	end
+end
+
+local function ensurePrimaryPart(model)
+	if model.PrimaryPart and model.PrimaryPart:IsA("BasePart") then return model.PrimaryPart end
+	local hrp = model:FindFirstChild("HumanoidRootPart")
+	if hrp and hrp:IsA("BasePart") then
+		model.PrimaryPart = hrp
+		return hrp
+	end
+	local bp = model:FindFirstChildWhichIsA("BasePart", true)
+	if bp then
+		model.PrimaryPart = bp
+		return bp
+	end
+	return nil
+end
+
+local function getNpcCost(npcName)
+	return npcCostCache[npcName] or 0
+end
+
+local function chargePlayer(player, cost)
+	local v = player:FindFirstChild("Values")
+	if not v then return false end
+	local e = v:FindFirstChild("Emeralds")
+	if not e or not e:IsA("IntValue") then return false end
+	if e.Value >= cost then
+		e.Value -= cost
+		return true
+	end
+	return false
+end
+
+local function countEmptyPlaces(player)
+	local v = player:FindFirstChild("Values")
+	if not v then return 0 end
+	local sp = v:FindFirstChild("SavedPlaces")
+	if not sp then return 0 end
+	local count = 0
+	for _, val in pairs(sp:GetChildren()) do
+		if (val:IsA("IntValue") and val.Value == 0) or (val:IsA("StringValue") and val.Value == "") then
+			count += 1
+		end
+	end
+	return count
+end
+
+local function saveNpcToPlace(player, npcName)
+	local v = player:FindFirstChild("Values")
+	if not v then return end
+	local sp = v:FindFirstChild("SavedPlaces")
+	if not sp then return end
+	local slots = sp:GetChildren()
+	table.sort(slots, function(a, b)
+		return (tonumber(a.Name:match("%d+")) or 0) < (tonumber(b.Name:match("%d+")) or 0)
+	end)
+	for _, val in pairs(slots) do
+		if val:IsA("StringValue") and val.Value == "" then
+			val.Value = npcName
+			return
+		elseif val:IsA("IntValue") and val.Value == 0 then
+			val:SetAttribute("LeaderName", npcName)
+			val.Value = 1
+			return
+		end
+	end
+end
+
+local function getPlayerOwnedLeaderSlots(player)
+	local v = player:FindFirstChild("Values")
+	if not v then return {} end
+	local sp = v:FindFirstChild("SavedPlaces")
+	if not sp then return {} end
+	local slots = {}
+	for _, child in ipairs(sp:GetChildren()) do
+		if child.Name:match("^Place%d+$") and (child:IsA("StringValue") or child:IsA("IntValue")) then
+			table.insert(slots, child)
+		end
+	end
+	table.sort(slots, function(a, b)
+		return (tonumber(a.Name:match("%d+")) or 0) < (tonumber(b.Name:match("%d+")) or 0)
+	end)
+	local results = {}
+	for _, slot in ipairs(slots) do
+		local leaderName
+		if slot:IsA("StringValue") and slot.Value ~= "" then
+			leaderName = slot.Value
+		elseif slot:IsA("IntValue") and slot.Value ~= 0 then
+			leaderName = slot:GetAttribute("LeaderName")
+		end
+		if leaderName and leaderName ~= "" then
+			table.insert(results, { SlotName = slot.Name, LeaderName = leaderName })
+		end
+	end
+	return results
+end
+
+local function getLeaderCount(player)
+	return #getPlayerOwnedLeaderSlots(player)
+end
+
+local function getPlayerCountryImageId(player)
+	local v = player:FindFirstChild("Values")
+	if not v then return nil end
+	local idVal = v:FindFirstChild("CountryImageId")
+	return idVal and tostring(idVal.Value) or nil
+end
+
+local function getPlayerColor(player)
+	local hue = (player.UserId * 137.508) % 360
+	return Color3.fromHSV(hue / 360, 0.75, 1)
+end
+
+local function getPlayerSpawnPart(player)
+	if playerSpawnCache[player] and playerSpawnCache[player].Parent then
+		return playerSpawnCache[player]
+	end
+	for _, base in pairs(basesFolder:GetChildren()) do
+		local v  = base:FindFirstChild("Values")
+		local sp = base:FindFirstChild("Spawn")
+		if v and sp then
+			local ownerVal = v:FindFirstChild("Owner")
+			if ownerVal and ownerVal.Value == player.Name then
+				playerSpawnCache[player] = sp
+				return sp
+			end
+		end
+	end
+	playerSpawnCache[player] = nil
+	return nil
+end
+
+local function getPlayerSpawnPartWait(player, maxWaitSeconds)
+	local t0 = os.clock()
+	while (os.clock() - t0) < (maxWaitSeconds or 12) do
+		local sp = getPlayerSpawnPart(player)
+		if sp then return sp end
+		task.wait(0.25)
+	end
+	return nil
+end
+
+local function getBaseOwnerNameFromSquare(square)
+	local base = baseSquareToBase[square]
+	if not base then return nil end
+	local v = base:FindFirstChild("Values")
+	local ownerVal = v and v:FindFirstChild("Owner")
+	if ownerVal and ownerVal:IsA("StringValue") then
+		local name = ownerVal.Value
+		if name ~= "" then return name end
+	end
+	return nil
+end
+
+local function refreshBaseSquareOwners()
+	for _, sq in ipairs(baseSquareList) do
+		if sq and sq.Parent then
+			local ownerName = getBaseOwnerNameFromSquare(sq)
+			if ownerName and ownerName ~= "" then
+				sq:SetAttribute("Owner", ownerName)
+			else
+				sq:SetAttribute("Owner", nil)
+			end
+		end
+	end
+end
+
+local function getSquareOwnerName(square)
+	local baseOwner = getBaseOwnerNameFromSquare(square)
+	if baseOwner then return baseOwner end
+	return squareOwners[square]
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- HOSTILITY
+-- ─────────────────────────────────────────────────────────────────────────────
+local function ensureCombatTable(aName)
+	hostileCombatUntil[aName] = hostileCombatUntil[aName] or {}
+end
+
+local function ensureTouchTable(aName)
+	hostileTouchUntil[aName] = hostileTouchUntil[aName] or {}
+end
+
+local function setHostileCombat(aName, bName, seconds)
+	if not aName or not bName or aName == "" or bName == "" or aName == bName then return end
+	ensureCombatTable(aName)
+	ensureCombatTable(bName)
+	local t = os.clock() + (seconds or HOSTILE_COMBAT_DURATION)
+	hostileCombatUntil[aName][bName] = math.max(hostileCombatUntil[aName][bName] or 0, t)
+	hostileCombatUntil[bName][aName] = math.max(hostileCombatUntil[bName][aName] or 0, t)
+	followFocusUntil[aName] = { targetName = bName, untilTime = os.clock() + FOLLOW_ASSIST_MEMORY }
+	followFocusUntil[bName] = { targetName = aName, untilTime = os.clock() + FOLLOW_ASSIST_MEMORY }
+end
+
+local function setHostileTouch(aName, bName, seconds)
+	if not aName or not bName or aName == "" or bName == "" or aName == bName then return end
+	ensureTouchTable(aName)
+	ensureTouchTable(bName)
+	local t = os.clock() + (seconds or HOSTILE_TOUCH_DURATION)
+	hostileTouchUntil[aName][bName] = math.max(hostileTouchUntil[aName][bName] or 0, t)
+	hostileTouchUntil[bName][aName] = math.max(hostileTouchUntil[bName][aName] or 0, t)
+end
+
+local function isHostile(aName, bName)
+	if not aName or not bName then return false end
 	local now = os.clock()
-	if now - combatAnim.lastDashAt < combatAnim.nextDashDelay then
-		return false
-	end
-
-	local myPos = model:GetPivot().Position
-	local toTarget = Vector3.new(targetPos.X - myPos.X, 0, targetPos.Z - myPos.Z)
-	if toTarget.Magnitude < 0.001 then return false end
-	local forward = toTarget.Unit
-	local right = Vector3.new(forward.Z, 0, -forward.X)
-
-	local dashDirName = chooseDashDirection(distXZ(myPos, targetPos))
-	local dashDir = forward
-	if dashDirName == "Back" then dashDir = -forward end
-	if dashDirName == "Left" then dashDir = -right end
-	if dashDirName == "Right" then dashDir = right end
-
-	local dashDistance = math.random() * (DASH_DISTANCE_MAX - DASH_DISTANCE_MIN) + DASH_DISTANCE_MIN
-	local dashTarget = myPos + dashDir * dashDistance
-
-	local track = combatAnim.dashTracks and combatAnim.dashTracks[dashDirName]
-	if track then
-		pcall(function() track:Play(0.03, 1, 1) end)
-	end
-
-	combatAnim.lastDashAt = now
-	combatAnim.nextDashDelay = math.random() * (DASH_COOLDOWN_MAX - DASH_COOLDOWN_MIN) + DASH_COOLDOWN_MIN
-	return moveToward(model, myPos, dashTarget, dt, speed * DASH_SPEED_MULT)
+	local ct = hostileCombatUntil[aName] and hostileCombatUntil[aName][bName] or 0
+	local tt = hostileTouchUntil[aName]  and hostileTouchUntil[aName][bName]  or 0
+	return (now <= ct) or (now <= tt)
 end
 
-function updateCloseCombat(model, combatAnim, targetPos, dt, speed)
-	local myPos = model:GetPivot().Position
-	local d = distXZ(myPos, targetPos)
+CombatTagEvent.Event:Connect(function(attackerName, victimName)
+	setHostileCombat(tostring(attackerName), tostring(victimName), HOSTILE_COMBAT_DURATION)
+end)
 
-	if d <= FIGHT_STANCE_RADIUS then
-		setFightStance(combatAnim, true)
-	else
-		setFightStance(combatAnim, false)
-	end
-
-	if d <= DASH_TRIGGER_RADIUS then
-		if performDash(model, combatAnim, targetPos, dt, speed) then
-			return true
+local function tryGetCreatorPlayerFromHumanoid(humanoid)
+	if not humanoid then return nil end
+	local tag = humanoid:FindFirstChild("creator") or humanoid:FindFirstChild("Creator") or humanoid:FindFirstChild("creatorTag")
+	if tag and tag:IsA("ObjectValue") then
+		local v = tag.Value
+		if typeof(v) == "Instance" then
+			if v:IsA("Player") then return v end
+			if v:IsA("Model") then return Players:GetPlayerFromCharacter(v) end
+			if v:IsA("Humanoid") then return Players:GetPlayerFromCharacter(v.Parent) end
 		end
 	end
-
-	return moveToward(model, myPos, targetPos, dt, speed)
+	return nil
 end
 
--- ModuleScript compatibility (safe no-op in normal Script usage).
-local api = {
-	setupSoldierCombatAnimations = setupSoldierCombatAnimations,
-	updateCloseCombat = updateCloseCombat,
+local function startPlayerDamageWatcher(player)
+	task.spawn(function()
+		local char = player.Character or player.CharacterAdded:Wait()
+		while player and player.Parent do
+			if not char or not char.Parent then
+				char = player.Character or player.CharacterAdded:Wait()
+			end
+			local hum = char and char:FindFirstChildOfClass("Humanoid")
+			if hum then
+				local last = hum.Health
+				hum.HealthChanged:Connect(function(hp)
+					if hp < last then
+						local attacker = tryGetCreatorPlayerFromHumanoid(hum)
+						if not attacker then
+							local myHrp = char and char:FindFirstChild("HumanoidRootPart")
+							if myHrp then
+								local bestP, bestD = nil, math.huge
+								for _, p in ipairs(Players:GetPlayers()) do
+									if p ~= player then
+										local ch2 = p.Character
+										local hrp2 = ch2 and ch2:FindFirstChild("HumanoidRootPart")
+										local hum2 = ch2 and ch2:FindFirstChildOfClass("Humanoid")
+										if hrp2 and hum2 and hum2.Health > 0 then
+											local d = distXZ(myHrp.Position, hrp2.Position)
+											if d < FALLBACK_NEAR_ATTACKER_RADIUS and d < bestD then
+												bestD = d
+												bestP = p
+											end
+										end
+									end
+								end
+								attacker = bestP
+							end
+						end
+						if attacker and attacker ~= player then
+							setHostileCombat(attacker.Name, player.Name, HOSTILE_COMBAT_DURATION)
+						end
+					end
+					last = hp
+				end)
+				player.CharacterAdded:Wait()
+				char = player.Character
+			else
+				task.wait(0.25)
+			end
+		end
+	end)
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- CACHE INIT
+-- ─────────────────────────────────────────────────────────────────────────────
+local function cacheRarityFolders()
+	rarityFoldersCache = {}
+	for _, folder in pairs(npcFolder:GetChildren()) do
+		if folder:IsA("Folder") then
+			rarityFoldersCache[folder.Name] = folder
+		end
+	end
+end
+
+local function cacheNpcCosts()
+	npcCostCache = {}
+	for _, rarityFolder in pairs(npcFolder:GetChildren()) do
+		if rarityFolder:IsA("Folder") then
+			for _, npc in pairs(rarityFolder:GetChildren()) do
+				local v = npc:FindFirstChild("Values")
+				if v then
+					local c = v:FindFirstChild("Cost")
+					if c and c:IsA("IntValue") then
+						npcCostCache[npc.Name] = c.Value
+					end
+				end
+			end
+		end
+	end
+end
+
+local function cacheSquares()
+	squareList = {}
+	for _, part in pairs(squaresFolder:GetChildren()) do
+		if part:IsA("BasePart") then
+			part.CanQuery = true
+			table.insert(squareList, part)
+		end
+	end
+end
+
+local function cacheBaseSquares()
+	baseSquareList   = {}
+	baseSquareToBase = {}
+	baseCenters      = {}
+	ownerBaseCenter  = {}
+
+	for _, base in ipairs(basesFolder:GetChildren()) do
+		local spawnPart = base:FindFirstChild("Spawn")
+		local center = (spawnPart and spawnPart:IsA("BasePart") and spawnPart.Position) or base:GetPivot().Position
+		table.insert(baseCenters, center)
+
+		local v = base:FindFirstChild("Values")
+		local ownerVal = v and v:FindFirstChild("Owner")
+		if ownerVal and ownerVal:IsA("StringValue") and ownerVal.Value ~= "" then
+			ownerBaseCenter[ownerVal.Value] = center
+		end
+
+		local squares = base:FindFirstChild("Squares")
+		if squares and squares:IsA("Folder") then
+			for _, sq in ipairs(squares:GetChildren()) do
+				if sq:IsA("BasePart") then
+					sq.CanQuery = true
+					sq:SetAttribute("IsBaseSquare", true)
+					baseSquareToBase[sq] = base
+					table.insert(baseSquareList, sq)
+				end
+			end
+		end
+	end
+end
+
+local function buildSquareNeighbors()
+	mapNeighbors = {}
+	if #squareList == 0 then return end
+	local sample = squareList[1]
+	local neighborDist = 0
+	if sample and sample:IsA("BasePart") then
+		local s = math.max(sample.Size.X, sample.Size.Z)
+		neighborDist = s * 1.15 + 1.0
+	else
+		neighborDist = 12
+	end
+	for _, a in ipairs(squareList) do
+		mapNeighbors[a] = {}
+	end
+	for i = 1, #squareList do
+		local a = squareList[i]
+		local ap = a.Position
+		for j = i + 1, #squareList do
+			local b = squareList[j]
+			local bp = b.Position
+			if distXZ(ap, bp) <= neighborDist then
+				table.insert(mapNeighbors[a], b)
+				table.insert(mapNeighbors[b], a)
+			end
+		end
+	end
+end
+
+local function rebuildBaseAdjacency()
+	baseAdjMapSquares = {}
+	if #squareList == 0 then return end
+	local sample = squareList[1]
+	local neighborDist = 12
+	if sample and sample:IsA("BasePart") then
+		local s = math.max(sample.Size.X, sample.Size.Z)
+		neighborDist = s * 1.25 + 2.0
+	end
+	for _, bsq in ipairs(baseSquareList) do
+		local owner = getBaseOwnerNameFromSquare(bsq)
+		if owner and owner ~= "" then
+			baseAdjMapSquares[owner] = baseAdjMapSquares[owner] or {}
+			for _, msq in ipairs(squareList) do
+				if distXZ(bsq.Position, msq.Position) <= neighborDist then
+					baseAdjMapSquares[owner][msq] = true
+				end
+			end
+		end
+	end
+end
+
+cacheRarityFolders()
+cacheNpcCosts()
+cacheSquares()
+cacheBaseSquares()
+buildSquareNeighbors()
+rebuildBaseAdjacency()
+
+task.defer(function()
+	task.wait(0.2)
+	refreshBaseSquareOwners()
+end)
+
+task.spawn(function()
+	while true do
+		task.wait(2)
+		refreshBaseSquareOwners()
+		cacheBaseSquares()
+		rebuildBaseAdjacency()
+	end
+end)
+
+basesFolder.ChildAdded:Connect(function()
+	task.wait(0.2)
+	cacheBaseSquares()
+	refreshBaseSquareOwners()
+	rebuildBaseAdjacency()
+end)
+basesFolder.ChildRemoved:Connect(function()
+	task.wait(0.2)
+	cacheBaseSquares()
+	refreshBaseSquareOwners()
+	rebuildBaseAdjacency()
+end)
+
+-- FIX B: clear touch-hostility when intruder leaves base area
+task.spawn(function()
+	while true do
+		task.wait(INTRUSION_CHECK_INTERVAL)
+		for ownerName, map in pairs(hostileTouchUntil) do
+			local baseC = ownerBaseCenter[ownerName]
+			if not baseC then
+				hostileTouchUntil[ownerName] = {}
+			else
+				for intruderName, untilTime in pairs(map) do
+					if os.clock() > untilTime then
+						map[intruderName] = nil
+					else
+						local intruderPlr = Players:FindFirstChild(intruderName)
+						local ch = intruderPlr and intruderPlr.Character
+						local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
+						if not hrp then
+							map[intruderName] = nil
+						elseif distXZ(hrp.Position, baseC) > INTRUSION_CLEAR_RADIUS then
+							map[intruderName] = nil
+						end
+					end
+				end
+			end
+		end
+	end
+end)
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- BASE INTRUSION TOUCH WATCHER
+-- ─────────────────────────────────────────────────────────────────────────────
+local function getPlayerFromHitPart(hit)
+	if not hit then return nil end
+	local char = hit:FindFirstAncestorWhichIsA("Model")
+	if not char then return nil end
+	return Players:GetPlayerFromCharacter(char)
+end
+
+local function bindBaseIntrusion(base)
+	if not base or not base.Parent then return end
+	local v = base:FindFirstChild("Values")
+	local ownerVal = v and v:FindFirstChild("Owner")
+	local function currentOwner()
+		return ownerVal and ownerVal:IsA("StringValue") and ownerVal.Value or ""
+	end
+	for _, d in ipairs(base:GetDescendants()) do
+		if d:IsA("BasePart") then
+			d.Touched:Connect(function(hit)
+				local intruder = getPlayerFromHitPart(hit)
+				local ownerName = currentOwner()
+				if intruder and ownerName ~= "" and intruder.Name ~= ownerName then
+					setHostileTouch(ownerName, intruder.Name, HOSTILE_TOUCH_DURATION)
+				end
+			end)
+		end
+	end
+	local sqFolder = base:FindFirstChild("Squares")
+	if sqFolder and sqFolder:IsA("Folder") then
+		for _, sq in ipairs(sqFolder:GetChildren()) do
+			if sq:IsA("BasePart") then
+				sq.Touched:Connect(function(hit)
+					local intruder = getPlayerFromHitPart(hit)
+					local ownerName = currentOwner()
+					if intruder and ownerName ~= "" and intruder.Name ~= ownerName then
+						setHostileTouch(ownerName, intruder.Name, HOSTILE_TOUCH_DURATION)
+					end
+				end)
+			end
+		end
+	end
+end
+
+for _, base in ipairs(basesFolder:GetChildren()) do
+	bindBaseIntrusion(base)
+end
+basesFolder.ChildAdded:Connect(function(base)
+	task.wait(0.2)
+	bindBaseIntrusion(base)
+end)
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- PERFECT WILD PLACEMENT
+-- ─────────────────────────────────────────────────────────────────────────────
+local function getModelBottomDeltaFromPivot(model)
+	local pivotY = model:GetPivot().Position.Y
+	local bbCF, bbSize = model:GetBoundingBox()
+	local bbBottomY = bbCF.Position.Y - (bbSize.Y * 0.5)
+	return pivotY - bbBottomY
+end
+
+local function raycastSquareTopY(square)
+	if square and square:IsA("BasePart") then square.CanQuery = true end
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Whitelist
+	params.FilterDescendantsInstances = { square }
+	params.IgnoreWater = true
+	local origin = square.Position + Vector3.new(0, 500, 0)
+	local result = workspace:Raycast(origin, Vector3.new(0, -1000, 0), params)
+	if result then return result.Position.Y end
+	return square.Position.Y + (square.Size.Y * 0.5)
+end
+
+local function placeModelOnSquareSurface(model, square, yawDeg)
+	local yaw = math.rad(yawDeg or 0)
+	local bottomDelta = getModelBottomDeltaFromPivot(model)
+	local surfaceY = raycastSquareTopY(square)
+	local targetPivotY = surfaceY + bottomDelta + 0.05
+	local pos = Vector3.new(square.Position.X, targetPivotY, square.Position.Z)
+	model:PivotTo(CFrame.new(pos) * CFrame.Angles(0, yaw, 0))
+end
+
+local function setupIdleOnAnchoredModel(model)
+	local controller = model:FindFirstChildOfClass("AnimationController")
+	if not controller then
+		controller = Instance.new("AnimationController")
+		controller.Name = "AnimationController"
+		controller.Parent = model
+	end
+	local animator = controller:FindFirstChildOfClass("Animator") or Instance.new("Animator", controller)
+	local chosenAnimId = nil
+	for _, d in ipairs(model:GetDescendants()) do
+		if d:IsA("Animation") then
+			if string.lower(d.Name):find("idle") then
+				chosenAnimId = d.AnimationId
+				break
+			end
+		end
+	end
+	local values = model:FindFirstChild("Values")
+	if not chosenAnimId and values then
+		local idleVal = values:FindFirstChild("IdleAnimId")
+		if idleVal then chosenAnimId = tostring(idleVal.Value) end
+	end
+	chosenAnimId = normalizeAnimId(chosenAnimId) or normalizeAnimId(LEADER_IDLE_FALLBACK_ANIM_ID)
+	if not chosenAnimId then return end
+	local anim = Instance.new("Animation")
+	anim.AnimationId = chosenAnimId
+	local ok, track = pcall(function() return animator:LoadAnimation(anim) end)
+	if not ok or not track then return end
+	track.Looped = true
+	track.Priority = Enum.AnimationPriority.Idle
+	pcall(function() track:Play(0.1, 1, 1) end)
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- LEVEL -> STATS
+-- ─────────────────────────────────────────────────────────────────────────────
+local LEVEL_MULT = {
+	[1] = { Speed=1.00, Damage=1.00, Aggro=1.00, PunchRange=1.00, Cooldown=1.00, ConquerTime=1.00 },
+	[2] = { Speed=1.06, Damage=1.10, Aggro=1.05, PunchRange=1.03, Cooldown=0.96, ConquerTime=0.95 },
+	[3] = { Speed=1.12, Damage=1.22, Aggro=1.10, PunchRange=1.06, Cooldown=0.92, ConquerTime=0.90 },
+	[4] = { Speed=1.18, Damage=1.36, Aggro=1.16, PunchRange=1.10, Cooldown=0.88, ConquerTime=0.84 },
+	[5] = { Speed=1.25, Damage=1.52, Aggro=1.22, PunchRange=1.15, Cooldown=0.84, ConquerTime=0.78 },
+	[6] = { Speed=1.32, Damage=1.70, Aggro=1.30, PunchRange=1.20, Cooldown=0.80, ConquerTime=0.72 },
+	[7] = { Speed=1.40, Damage=1.92, Aggro=1.40, PunchRange=1.28, Cooldown=0.76, ConquerTime=0.66 },
+	[8] = { Speed=1.50, Damage=2.20, Aggro=1.55, PunchRange=1.35, Cooldown=0.72, ConquerTime=0.60 },
 }
 
-if script and script:IsA("ModuleScript") then
-	return api
+local function readSoldierLevelFromValues(model)
+	local values = model:FindFirstChild("Values")
+	if not values then return 1 end
+	local lv = values:FindFirstChild("Level")
+	if lv and lv:IsA("IntValue") then return math.clamp(lv.Value, 1, 8) end
+	return 1
 end
+
+local function buildSoldierStats(level)
+	level = math.clamp(tonumber(level) or 1, 1, 8)
+	local m = LEVEL_MULT[level] or LEVEL_MULT[1]
+	return {
+		Level = level,
+		Speed = SOLDIER_SPEED * m.Speed,
+		AttackDamage   = ATTACK_DAMAGE * m.Damage,
+		AggroRadius    = ATTACK_AGGRO_RADIUS * m.Aggro,
+		PunchRange     = ATTACK_PUNCH_RANGE * m.PunchRange,
+		AttackCooldown = ATTACK_COOLDOWN * m.Cooldown,
+		ConquerTime    = CONQUEST_TIME * m.ConquerTime,
+	}
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- MODE TABLES
+-- ─────────────────────────────────────────────────────────────────────────────
+local VALID_MODES = { Defend=true, Conquer=true, Attack=true, Follow=true }
+
+local function ensurePlayerModeTable(player)
+	playerSoldierModes[player] = playerSoldierModes[player] or {}
+	playerAttackTarget[player] = playerAttackTarget[player] or { Pattern="Default", TargetName=nil }
+end
+
+SoldierCommandEvent.OnServerEvent:Connect(function(player, action, a, b)
+	ensurePlayerModeTable(player)
+	if action == "SetState" then
+		local slotName = tostring(a)
+		local mode = tostring(b)
+		if VALID_MODES[mode] then
+			playerSoldierModes[player][slotName] = mode
+		end
+	elseif action == "SetAll" then
+		local mode = tostring(a)
+		if not VALID_MODES[mode] then return end
+		for _, item in ipairs(getPlayerOwnedLeaderSlots(player)) do
+			playerSoldierModes[player][item.SlotName] = mode
+		end
+	elseif action == "SetAttackTarget" then
+		local pattern = tostring(a or "Default")
+		local targetName = b and tostring(b) or nil
+		if pattern ~= "Specific" then pattern = "Default" targetName = nil end
+		playerAttackTarget[player] = { Pattern = pattern, TargetName = targetName }
+	end
+end)
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- SQUARE VISUALS
+-- ─────────────────────────────────────────────────────────────────────────────
+local function getOrCreateSquareGui(square)
+	if squareGuiCache[square] then return squareGuiCache[square] end
+	local old = square:FindFirstChild("ConquestGui")
+	if old then old:Destroy() end
+	local gui = Instance.new("SurfaceGui")
+	gui.Name = "ConquestGui"
+	gui.Face = Enum.NormalId.Top
+	gui.SizingMode = Enum.SurfaceGuiSizingMode.PixelsPerStud
+	gui.PixelsPerStud = 40
+	gui.AlwaysOnTop = false
+	gui.Parent = square
+	local flagLabel = Instance.new("ImageLabel")
+	flagLabel.Name = "FlagLabel"
+	flagLabel.Size = UDim2.fromScale(1, 1)
+	flagLabel.Position = UDim2.fromScale(0, 0)
+	flagLabel.BackgroundTransparency = 1
+	flagLabel.ScaleType = Enum.ScaleType.Stretch
+	flagLabel.Image = ""
+	flagLabel.Visible = false
+	flagLabel.Parent = gui
+	local data = { flagLabel = flagLabel }
+	squareGuiCache[square] = data
+	return data
+end
+
+local function applyConqueredVisuals(square, player)
+	if square and square:GetAttribute("IsBaseSquare") then
+		square:SetAttribute("Owner", getSquareOwnerName(square))
+		return
+	end
+	local imageId = getPlayerCountryImageId(player)
+	local color   = getPlayerColor(player)
+	square.Material = Enum.Material.Neon
+	square.Color    = Color3.new(color.R * 0.35, color.G * 0.35, color.B * 0.35)
+	square:SetAttribute("Owner", player.Name)
+	local data = getOrCreateSquareGui(square)
+	if imageId and imageId ~= "" and imageId ~= "0" then
+		data.flagLabel.Image   = "rbxassetid://" .. imageId
+		data.flagLabel.Visible = true
+	else
+		data.flagLabel.Visible = false
+	end
+end
+
+local function clearSquareVisuals(square)
+	if square and square:GetAttribute("IsBaseSquare") then
+		square:SetAttribute("Owner", getSquareOwnerName(square))
+		return
+	end
+	square.Material = Enum.Material.SmoothPlastic
+	square.Color    = Color3.fromRGB(163, 162, 165)
+	square:SetAttribute("Owner", nil)
+	if squareGuiCache[square] then squareGuiCache[square].flagLabel.Visible = false end
+end
+
+local function refreshConqueredSquaresForPlayer(player)
+	for _, sq in ipairs(squareList) do
+		if squareOwners[sq] == player.Name then
+			applyConqueredVisuals(sq, player)
+		end
+	end
+end
+
+local function setSquareOwner(square, player, leaderName)
+	if square and square:GetAttribute("IsBaseSquare") then return end
+	squareOwners[square] = player.Name
+	applyConqueredVisuals(square, player)
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- WILD TIMER
+-- ─────────────────────────────────────────────────────────────────────────────
+local WHITE  = Color3.fromRGB(255, 255, 255)
+local ORANGE = Color3.fromRGB(255, 170, 0)
+local RED    = Color3.fromRGB(255,  60,  60)
+
+local function lerpColor(a, b, t)
+	return Color3.new(a.R+(b.R-a.R)*t, a.G+(b.G-a.G)*t, a.B+(b.B-a.B)*t)
+end
+
+local function getDespawnColor(secondsLeft, total)
+	total = math.max(1, total or 1)
+	local t = 1 - (secondsLeft / total)
+	if t <= 0.5 then return lerpColor(WHITE, ORANGE, t / 0.5)
+	else return lerpColor(ORANGE, RED, (t - 0.5) / 0.5) end
+end
+
+local function findWildTimerText(model)
+	local timerGui = model:FindFirstChild("Timer", true)
+	if timerGui and timerGui:IsA("BillboardGui") then
+		local lbl = timerGui:FindFirstChild("Time", true)
+		if lbl and (lbl:IsA("TextLabel") or lbl:IsA("TextBox")) then return lbl end
+	end
+	for _, d in ipairs(model:GetDescendants()) do
+		if (d:IsA("TextLabel") or d:IsA("TextBox")) and d.Name == "Time" then return d end
+	end
+	return nil
+end
+
+local function startWildDespawnCountdown(model, square, seconds)
+	local lbl = findWildTimerText(model)
+	local total = math.max(1, math.floor(tonumber(seconds) or 30))
+	if lbl then lbl.Visible = true end
+	task.spawn(function()
+		local endAt = os.clock() + total
+		local lastShown = -1
+		while model and model.Parent do
+			local left = math.max(0, math.ceil(endAt - os.clock()))
+			if left ~= lastShown then
+				lastShown = left
+				if lbl and lbl.Parent then
+					lbl.Text = tostring(left) .. "s"
+					lbl.TextColor3 = getDespawnColor(left, total)
+				end
+			end
+			if left <= 0 then break end
+			task.wait(0.1)
+		end
+		if model and model.Parent then
+			occupiedSquares[square] = nil
+			model:Destroy()
+		end
+	end)
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- RARITY + WILD SPAWNS
+-- ─────────────────────────────────────────────────────────────────────────────
+local function chooseRarityFolder()
+	if mythicCountdown <= 0 then
+		mythicCountdown = mythicTime
+		return rarityFoldersCache["Mythic"], "Mythic"
+	end
+	if legendaryCountdown <= 0 then
+		legendaryCountdown = legendaryTime
+		return rarityFoldersCache["Legendary"], "Legendary"
+	end
+	local chances = {
+		{ FolderName="Common",      Chance=49.5  },
+		{ FolderName="Rare",        Chance=34.0  },
+		{ FolderName="Epic",        Chance=15.0  },
+		{ FolderName="Legendary",   Chance=1.0   },
+		{ FolderName="Mythic",      Chance=0.35  },
+		{ FolderName="Ancient Mob", Chance=0.1   },
+		{ FolderName="Secret",      Chance=0.05  },
+	}
+	local roll, cumulative = math.random() * 100, 0
+	for _, entry in ipairs(chances) do
+		cumulative += entry.Chance
+		if roll <= cumulative then return rarityFoldersCache[entry.FolderName], entry.FolderName end
+	end
+	return nil, nil
+end
+
+local function getAllFreeSquares(list)
+	local free = {}
+	for _, sq in ipairs(list) do
+		if not occupiedSquares[sq] then table.insert(free, sq) end
+	end
+	return free
+end
+
+local function chooseFreeMapSquareNearBases()
+	local near = {}
+	for _, sq in ipairs(squareList) do
+		if not occupiedSquares[sq] then
+			local p = sq.Position
+			for _, c in ipairs(baseCenters) do
+				if distXZ(p, c) <= NEAR_BASE_RADIUS_STUDS then
+					table.insert(near, sq)
+					break
+				end
+			end
+		end
+	end
+	if #near == 0 then return nil end
+	return near[math.random(1, #near)]
+end
+
+local function chooseAnyFreeMapSquare()
+	local free = getAllFreeSquares(squareList)
+	if #free == 0 then return nil end
+	return free[math.random(1, #free)]
+end
+
+local function pickNpcFromFolder(rarityFolder, allowedNames)
+	local allNpcs = rarityFolder:GetChildren()
+	if #allNpcs == 0 then return nil end
+	if allowedNames and #allowedNames > 0 then
+		local pool, allow = {}, {}
+		for _, n in ipairs(allowedNames) do allow[tostring(n)] = true end
+		for _, npc in ipairs(allNpcs) do
+			if allow[npc.Name] then table.insert(pool, npc) end
+		end
+		if #pool > 0 then return pool[math.random(1, #pool)] end
+		return nil
+	end
+	return allNpcs[math.random(1, #allNpcs)]
+end
+
+local function spawnWildOnSquare(square, rarityFolder, allowedNames)
+	if not square or not rarityFolder then return nil end
+	if occupiedSquares[square] then return nil end
+	local chosen = pickNpcFromFolder(rarityFolder, allowedNames)
+	if not chosen then return nil end
+	local clone = chosen:Clone()
+	clone.Parent = workspace
+	occupiedSquares[square] = clone
+	local yaw = math.random(0, 360)
+	setModelAnchored(clone, true)
+	zeroModelVelocity(clone)
+	placeModelOnSquareSurface(clone, square, yaw)
+	zeroModelVelocity(clone)
+	for _, d in ipairs(clone:GetDescendants()) do
+		if d:IsA("BasePart") then d.CanCollide = true end
+	end
+	setupIdleOnAnchoredModel(clone)
+	if WILD_SQUARE_LOCK_SECONDS and WILD_SQUARE_LOCK_SECONDS > 0 then
+		local lockUntil = os.clock() + WILD_SQUARE_LOCK_SECONDS
+		task.spawn(function()
+			while clone and clone.Parent and os.clock() < lockUntil do
+				placeModelOnSquareSurface(clone, square, yaw)
+				task.wait()
+			end
+		end)
+	end
+	startWildDespawnCountdown(clone, square, WILD_LEADER_DESPAWN_TIME)
+	local torso = clone:FindFirstChild("Torso") or clone:FindFirstChild("HumanoidRootPart")
+	if torso then
+		local prompt = torso:FindFirstChildWhichIsA("ProximityPrompt") or Instance.new("ProximityPrompt")
+		prompt.ActionText            = "Buy Leader"
+		prompt.ObjectText            = clone.Name .. " (" .. getNpcCost(clone.Name) .. " 💎)"
+		prompt.MaxActivationDistance = 10
+		prompt.Parent                = torso
+		prompt.Triggered:Connect(function(buyer)
+			if not (clone and clone.Parent) then return end
+			local ownerName = getSquareOwnerName(square)
+			if ownerName ~= buyer.Name then
+				if square:GetAttribute("IsBaseSquare") then
+					sendPlayerFeedback(buyer, "This leader is in a base-only square!", true)
+				else
+					sendPlayerFeedback(buyer, "You must conquer this square first!", true)
+				end
+				return
+			end
+			if countEmptyPlaces(buyer) <= 0 then
+				sendPlayerFeedback(buyer, "No free leader slots!", true)
+				return
+			end
+			if not chargePlayer(buyer, getNpcCost(clone.Name)) then
+				sendPlayerFeedback(buyer, "Not enough emeralds!", true)
+				return
+			end
+			saveNpcToPlace(buyer, clone.Name)
+			occupiedSquares[square] = nil
+			sendPlayerFeedback(buyer, "Leader purchased!", false)
+			if clone and clone.Parent then clone:Destroy() end
+		end)
+	end
+	return clone
+end
+
+local function spawnRegularWildNpc()
+	local rarityFolder, rarityName = chooseRarityFolder()
+	if not rarityFolder then return end
+	local square = nil
+	if (rarityName == "Common" or rarityName == "Rare") and math.random() < COMMON_RARE_NEARBASE_CHANCE then
+		square = chooseFreeMapSquareNearBases()
+	end
+	square = square or chooseAnyFreeMapSquare()
+	if not square then return end
+	spawnWildOnSquare(square, rarityFolder)
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- BASE STARTER HELP
+-- ─────────────────────────────────────────────────────────────────────────────
+local function countActiveBaseWildForOwner(ownerName)
+	local count = 0
+	for _, sq in ipairs(baseSquareList) do
+		if getBaseOwnerNameFromSquare(sq) == ownerName then
+			local m = occupiedSquares[sq]
+			if m and m.Parent then count += 1 end
+		end
+	end
+	return count
+end
+
+local function getFreeBaseSquaresForOwner(ownerName)
+	local free = {}
+	for _, sq in ipairs(baseSquareList) do
+		if getBaseOwnerNameFromSquare(sq) == ownerName and not occupiedSquares[sq] then
+			table.insert(free, sq)
+		end
+	end
+	return free
+end
+
+local function trySpawnBaseHelpForOwner(ownerName)
+	if not ownerName or ownerName == "" then return end
+	local now = os.clock()
+	local cd = baseHelpCooldownUntil[ownerName]
+	if cd and now < cd then return end
+	local plr = Players:FindFirstChild(ownerName)
+	if not plr then return end
+	local leaderCount = getLeaderCount(plr)
+	if leaderCount >= 3 then return end
+	if countActiveBaseWildForOwner(ownerName) >= BASE_HELP_MAX_ACTIVE_PER_OWNER then return end
+	local freeSquares = getFreeBaseSquaresForOwner(ownerName)
+	if #freeSquares == 0 then return end
+	local commonFolder = rarityFoldersCache["Common"]
+	if not commonFolder then return end
+	local allowedNames = nil
+	if leaderCount <= 0 then
+		allowedNames = { "Leon Monteiro", "Mo Ghazoni" }
+	end
+	local sq = freeSquares[math.random(1, #freeSquares)]
+	local ok = spawnWildOnSquare(sq, commonFolder, allowedNames)
+	if ok then
+		baseHelpCooldownUntil[ownerName] = now + BASE_HELP_COOLDOWN_SECONDS
+	end
+end
+
+local function collectBaseOwners()
+	local owners, seen = {}, {}
+	for _, sq in ipairs(baseSquareList) do
+		local ownerName = getBaseOwnerNameFromSquare(sq)
+		if ownerName and not seen[ownerName] then
+			seen[ownerName] = true
+			table.insert(owners, ownerName)
+		end
+	end
+	return owners
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- SOLDIERS
+-- ─────────────────────────────────────────────────────────────────────────────
+local conquestNpcsFolder = workspace:FindFirstChild("ConquestNpcs") or Instance.new("Folder")
+conquestNpcsFolder.Name   = "ConquestNpcs"
+conquestNpcsFolder.Parent = workspace
+
+local function getSoldierModel(leaderName)
+	local direct = soldiersFolder:FindFirstChild(leaderName)
+	if direct then return direct end
+	local children = soldiersFolder:GetChildren()
+	if #children > 0 then return children[math.random(1, #children)] end
+	return nil
+end
+
+local function killDefaultAnimate(model)
+	for _, d in ipairs(model:GetDescendants()) do
+		if (d:IsA("Script") or d:IsA("LocalScript")) and d.Name == "Animate" then
+			d:Destroy()
+		end
+	end
+end
+
+local function applySoldierNameUI(model, ownerName)
+	local namePart = model:FindFirstChild("Name")
+	if not namePart then return end
+	local ownerNameObj = namePart:FindFirstChild("OwnerName") or namePart:FindFirstChildWhichIsA("TextLabel", true)
+	if not ownerNameObj then return end
+	local text = ownerName .. "'s Leader"
+	if ownerNameObj:IsA("TextLabel") or ownerNameObj:IsA("TextBox") then
+		ownerNameObj.Text = text
+		ownerNameObj.Visible = true
+	elseif ownerNameObj:IsA("StringValue") then
+		ownerNameObj.Value = text
+	end
+end
+
+local function findModesIconsBillboard(model)
+	local bb = model:FindFirstChild("ModesIcons")
+	if bb and bb:IsA("BillboardGui") then return bb end
+	bb = model:FindFirstChild("ModesIcons", true)
+	if bb and bb:IsA("BillboardGui") then return bb end
+	for _, d in ipairs(model:GetDescendants()) do
+		if d:IsA("BillboardGui") then
+			local a = d:FindFirstChild("attack", true) or d:FindFirstChild("Attack", true)
+			local de = d:FindFirstChild("defend", true) or d:FindFirstChild("Defend", true)
+			if a or de then return d end
+		end
+	end
+	return nil
+end
+
+local function findIconImageLabel(billboardGui, wantedLower)
+	if not billboardGui then return nil end
+	local direct = billboardGui:FindFirstChild(wantedLower)
+		or billboardGui:FindFirstChild(wantedLower:sub(1,1):upper() .. wantedLower:sub(2))
+	if direct and direct:IsA("ImageLabel") then return direct end
+	for _, d in ipairs(billboardGui:GetDescendants()) do
+		if d:IsA("ImageLabel") and string.lower(d.Name) == wantedLower then return d end
+	end
+	return nil
+end
+
+local function ensureBillboardEnabled(bb)
+	if not bb then return end
+	bb.Enabled = true
+	if not bb.Adornee then
+		local adornee = (bb.Parent and bb.Parent:IsA("BasePart") and bb.Parent) or nil
+		if adornee then bb.Adornee = adornee end
+	end
+end
+
+local function setModesIcons(attackLabel, defendLabel, showAttack, showDefend)
+	if attackLabel then
+		local bb = attackLabel:FindFirstAncestorWhichIsA("BillboardGui")
+		if bb then ensureBillboardEnabled(bb) end
+		attackLabel.Visible = (showAttack == true)
+	end
+	if defendLabel then
+		local bb = defendLabel:FindFirstAncestorWhichIsA("BillboardGui")
+		if bb then ensureBillboardEnabled(bb) end
+		defendLabel.Visible = (showDefend == true)
+	end
+end
+
+local function setupSoldierAnimations(model)
+	local humanoid   = model:FindFirstChildOfClass("Humanoid")
+	local controller = model:FindFirstChildOfClass("AnimationController")
+	if not humanoid and not controller then
+		controller = Instance.new("AnimationController")
+		controller.Name = "AnimationController"
+		controller.Parent = model
+	end
+	local animator
+	if humanoid then
+		animator = humanoid:FindFirstChildOfClass("Animator") or Instance.new("Animator", humanoid)
+	else
+		animator = controller:FindFirstChildOfClass("Animator") or Instance.new("Animator", controller)
+	end
+	local function loadTrack(animId, looped, priority)
+		animId = normalizeAnimId(animId)
+		if not animId then return nil end
+		local anim = Instance.new("Animation")
+		anim.AnimationId = animId
+		local ok, trackOrErr = pcall(function() return animator:LoadAnimation(anim) end)
+		if not ok or not trackOrErr then return nil end
+		local track = trackOrErr
+		track.Looped = looped
+		track.Priority = priority
+		return track
+	end
+	local idleTrack    = loadTrack(SOLDIER_IDLE_ANIM_ID, true,  Enum.AnimationPriority.Idle)
+	local walkTrack    = loadTrack(WALK_ANIM_ID,         true,  Enum.AnimationPriority.Movement)
+	local conquerTrack = loadTrack(CONQUER_ANIM_ID,      true,  Enum.AnimationPriority.Action)
+	local alertTrack   = loadTrack(ALERT_ANIM_ID,        true,  Enum.AnimationPriority.Action)
+	local punchTrack   = loadTrack(PUNCH_ANIM_ID,        false, Enum.AnimationPriority.Action)
+	local state = {
+		idleTrack=idleTrack, walkTrack=walkTrack, conquerTrack=conquerTrack,
+		alertTrack=alertTrack, punchTrack=punchTrack, mode="idle"
+	}
+	local function safeStop(t, fade)
+		if t and t.IsPlaying then pcall(function() t:Stop(fade or 0.08) end) end
+	end
+	local function safePlayLoop(t, fade)
+		if not t then return end
+		if t.IsPlaying then return end
+		pcall(function() t.Looped=true; t:Play(fade or 0.08, 1, 1) end)
+	end
+	function state:SetMode(newMode)
+		if self.mode == newMode then return end
+		self.mode = newMode
+		if newMode == "punch" then
+			safeStop(self.idleTrack,0.05); safeStop(self.walkTrack,0.05)
+			safeStop(self.conquerTrack,0.05); safeStop(self.alertTrack,0.05)
+			if self.punchTrack then pcall(function() self.punchTrack.Looped=false; self.punchTrack:Play(0.05,1,1) end) end
+		elseif newMode == "alert" then
+			safeStop(self.idleTrack,0.08); safeStop(self.walkTrack,0.08); safeStop(self.conquerTrack,0.08)
+			if self.alertTrack then safePlayLoop(self.alertTrack,0.08) else safePlayLoop(self.walkTrack,0.08) end
+		elseif newMode == "conquer" then
+			safeStop(self.idleTrack,0.12); safeStop(self.walkTrack,0.12); safeStop(self.alertTrack,0.12)
+			safePlayLoop(self.conquerTrack,0.08)
+		elseif newMode == "walk" then
+			safeStop(self.idleTrack,0.12); safeStop(self.conquerTrack,0.12); safeStop(self.alertTrack,0.12)
+			safePlayLoop(self.walkTrack,0.08)
+		else
+			safeStop(self.conquerTrack,0.12); safeStop(self.walkTrack,0.12); safeStop(self.alertTrack,0.12)
+			safePlayLoop(self.idleTrack,0.10)
+		end
+	end
+	state:SetMode("idle")
+	return state
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- ✅ USER FIX 3: RESPAWN TIMER BILLBOARD HELPER
+-- ─────────────────────────────────────────────────────────────────────────────
+local function setRespawnTimerLabel(player, leaderName, slotName, text)
+	for _, base in ipairs(basesFolder:GetChildren()) do
+		local v = base:FindFirstChild("Values")
+		local ownerVal = v and v:FindFirstChild("Owner")
+		if ownerVal and ownerVal.Value == player.Name then
+			local placesFolder = base:FindFirstChild("Places")
+			if placesFolder then
+				local placeSlot = placesFolder:FindFirstChild(slotName)
+				local npcModel = nil
+				if placeSlot and placeSlot:IsA("Folder") then
+					npcModel = placeSlot:FindFirstChildWhichIsA("Model")
+					if not npcModel then
+						for _, child in ipairs(placeSlot:GetChildren()) do
+							if child:IsA("Model") then npcModel = child; break end
+						end
+					end
+				end
+				if not npcModel then
+					for _, child in ipairs(placesFolder:GetDescendants()) do
+						if child:IsA("Model") and child.Name == leaderName then
+							npcModel = child; break
+						end
+					end
+				end
+				if npcModel then
+					local timerBB = npcModel:FindFirstChild("Timer")
+					if timerBB and timerBB:IsA("BillboardGui") then
+						local timeLabel = timerBB:FindFirstChild("Time")
+						if timeLabel and (timeLabel:IsA("TextLabel") or timeLabel:IsA("TextBox")) then
+							timeLabel.Text    = text
+							timeLabel.Visible = (text ~= "")
+						end
+					end
+					return
+				end
+			end
+		end
+	end
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- CONQUER CONNECTIVITY
+-- ─────────────────────────────────────────────────────────────────────────────
+local function isSquareConnectedToPlayer(square, playerName)
+	if baseAdjMapSquares[playerName] and baseAdjMapSquares[playerName][square] then return true end
+	local neigh = mapNeighbors[square]
+	if neigh then
+		for _, n in ipairs(neigh) do
+			if squareOwners[n] == playerName then return true end
+		end
+	end
+	return false
+end
+
+local function findConquerTargetWithSpread(position, playerName, mySoldierId, basePos)
+	local baseDirX = position.X - basePos.X
+	local baseDirZ = position.Z - basePos.Z
+	local baseDirLen = math.sqrt(baseDirX*baseDirX + baseDirZ*baseDirZ)
+	if baseDirLen < 0.1 then baseDirX, baseDirZ, baseDirLen = 1, 0, 1 end
+	local baseDirNX = baseDirX / baseDirLen
+	local baseDirNZ = baseDirZ / baseDirLen
+
+	local idealAngle = math.rad(CONQUER_SPREAD_ANGLE_IDEAL_DEG)
+
+	local best, bestScore = nil, math.huge
+
+	for _, sq in ipairs(squareList) do
+		if squareOwners[sq] ~= playerName then
+			if isSquareConnectedToPlayer(sq, playerName) then
+				local reservation = squareReservations[sq]
+				if reservation == nil or reservation == mySoldierId then
+					local dist = distXZ(position, sq.Position)
+
+					local toDX = sq.Position.X - basePos.X
+					local toDZ = sq.Position.Z - basePos.Z
+					local toDLen = math.sqrt(toDX*toDX + toDZ*toDZ)
+					local angleDiff = 0
+					if toDLen > 0.1 then
+						local dotVal = math.clamp((baseDirNX*(toDX/toDLen) + baseDirNZ*(toDZ/toDLen)), -1, 1)
+						local angle = math.acos(dotVal)
+						angleDiff = math.abs(angle - idealAngle)
+					end
+
+					local noise = (math.random() * 2 - 1) * CONQUER_SPREAD_NOISE
+					local score = CONQUER_SPREAD_DISTANCE_WEIGHT * dist
+						+ CONQUER_SPREAD_ANGLE_WEIGHT * math.deg(angleDiff)
+						+ noise
+
+					if score < bestScore then
+						bestScore = score
+						best = sq
+					end
+				end
+			end
+		end
+	end
+	return best, bestScore
+end
+
+local function findNearestOwnedOrBaseAdjSquare(position, playerName)
+	local best, bestDist = nil, math.huge
+	for _, sq in ipairs(squareList) do
+		if squareOwners[sq] == playerName then
+			local d = (sq.Position - position).Magnitude
+			if d < bestDist then bestDist = d; best = sq end
+		end
+	end
+	if baseAdjMapSquares[playerName] then
+		for sq, ok in pairs(baseAdjMapSquares[playerName]) do
+			if ok and sq and sq.Parent then
+				local d = (sq.Position - position).Magnitude
+				if d < bestDist then bestDist = d; best = sq end
+			end
+		end
+	end
+	return best, bestDist
+end
+
+local function isTargetInFront(myCF, targetPos)
+	local forward = Vector3.new(myCF.LookVector.X, 0, myCF.LookVector.Z)
+	if forward.Magnitude < 0.001 then return true end
+	forward = forward.Unit
+	local toTarget = Vector3.new(targetPos.X - myCF.Position.X, 0, targetPos.Z - myCF.Position.Z)
+	if toTarget.Magnitude < 0.001 then return true end
+	toTarget = toTarget.Unit
+	return forward:Dot(toTarget) >= math.cos(math.rad(ATTACK_FOV_DEGREES / 2))
+end
+
+local function faceTarget(model, myPos, targetPos)
+	local dir = Vector3.new(targetPos.X - myPos.X, 0, targetPos.Z - myPos.Z)
+	if dir.Magnitude > 0.01 then model:PivotTo(CFrame.lookAt(myPos, myPos + dir.Unit)) end
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- SOLDIER SPAWN + BRAIN
+-- ─────────────────────────────────────────────────────────────────────────────
+local function getGroundedSpawnCFrame(spawnPart, model, attempts, radius)
+	attempts = attempts or 12
+	radius   = radius or 10
+	local pp = ensurePrimaryPart(model)
+	if not spawnPart or not spawnPart:IsA("BasePart") or not pp then
+		return CFrame.new(spawnPart and spawnPart.Position or Vector3.new(0, 20, 0))
+	end
+	local ext = model:GetExtentsSize()
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Blacklist
+	params.FilterDescendantsInstances = { model }
+	params.IgnoreWater = true
+	local base = spawnPart.Position
+	for _ = 1, attempts do
+		local ox = math.random(-radius, radius)
+		local oz = math.random(-radius, radius)
+		local origin = Vector3.new(base.X + ox, base.Y + 120, base.Z + oz)
+		local hit = workspace:Raycast(origin, Vector3.new(0, -300, 0), params)
+		if hit and hit.Instance and hit.Instance:IsA("BasePart") then
+			local y = hit.Position.Y + (ext.Y / 2) + 0.25
+			local pos = Vector3.new(base.X + ox, y, base.Z + oz)
+			return CFrame.new(pos) * CFrame.Angles(0, math.rad(math.random(0, 360)), 0)
+		end
+	end
+	local yFallback = base.Y + (spawnPart.Size.Y / 2) + (ext.Y / 2) + 0.25
+	return CFrame.new(Vector3.new(base.X, yFallback, base.Z)) * CFrame.Angles(0, math.rad(math.random(0,360)), 0)
+end
+
+local function spawnSoldierForPlayer(player, leaderName, slotName)
+	local spawnPart = getPlayerSpawnPartWait(player, 12)
+	if not spawnPart then
+		warn("[NpcSquareSystem] No spawn part for player:", player.Name, "slot:", slotName)
+		return nil
+	end
+
+	local soldierTemplate = getSoldierModel(leaderName)
+	if not soldierTemplate then
+		warn("[NpcSquareSystem] No soldier model for:", leaderName)
+		return nil
+	end
+
+	local clone = soldierTemplate:Clone()
+	killDefaultAnimate(clone)
+
+	clone.Name   = "Soldier_" .. player.Name .. "_" .. leaderName .. "_" .. tostring(slotName)
+	clone.Parent = conquestNpcsFolder
+
+	clone:SetAttribute("OwnerName",  player.Name)
+	clone:SetAttribute("LeaderName", leaderName)
+	clone:SetAttribute("SlotName",   tostring(slotName))
+	clone:SetAttribute("Mode", "Conquer")
+	clone:SetAttribute("IsAttacking", false)
+
+	local level = readSoldierLevelFromValues(clone)
+	local stats = buildSoldierStats(level)
+
+	clone:SetAttribute("Level", level)
+	clone:SetAttribute("Atk",   math.floor(stats.AttackDamage + 0.5))
+	clone:SetAttribute("Spd",   math.floor(stats.Speed * 100) / 100)
+	clone:SetAttribute("Aggro", math.floor(stats.AggroRadius + 0.5))
+
+	applySoldierNameUI(clone, player.Name)
+
+	for _, part in ipairs(clone:GetDescendants()) do
+		if part:IsA("BasePart") then part.LocalTransparencyModifier = 0 end
+	end
+	local originalTransparency = captureOriginalTransparency(clone)
+
+	setModelAnchored(clone, true)
+	local spawnCF = getGroundedSpawnCFrame(spawnPart, clone, 14, 10)
+	clone:PivotTo(spawnCF)
+	zeroModelVelocity(clone)
+	restoreVisibility(clone, originalTransparency)
+
+	task.delay(0.35, function()
+		if clone and clone.Parent then
+			zeroModelVelocity(clone)
+			setModelAnchored(clone, false)
+			local hum = clone:FindFirstChildOfClass("Humanoid")
+			if hum then pcall(function() hum:ChangeState(Enum.HumanoidStateType.GettingUp) end) end
+		end
+	end)
+
+	local animState = setupSoldierAnimations(clone)
+
+	local modesBB = findModesIconsBillboard(clone)
+	local iconAttackObj = findIconImageLabel(modesBB, "attack")
+	local iconDefendObj = findIconImageLabel(modesBB, "defend")
+	if modesBB then ensureBillboardEnabled(modesBB) end
+	setModesIcons(iconAttackObj, iconDefendObj, false, false)
+
+	task.spawn(function()
+		while clone and clone.Parent do
+			task.wait(1.5)
+			restoreVisibility(clone, originalTransparency)
+		end
+	end)
+
+	-- ✅ USER FIX 3: Death detection
+	do
+		local hum = clone:FindFirstChildOfClass("Humanoid")
+		if hum then
+			hum.Died:Connect(function()
+				soldierRespawning[player] = soldierRespawning[player] or {}
+				if soldierRespawning[player][tostring(slotName)] then return end
+				soldierRespawning[player][tostring(slotName)] = true
+
+				if playerSoldiers[player] and playerSoldiers[player][tostring(slotName)] == clone then
+					playerSoldiers[player][tostring(slotName)] = nil
+				end
+
+				task.delay(4, function()
+					if clone and clone.Parent then clone:Destroy() end
+				end)
+
+				local respawnSeconds = RESPAWN_TIME_BY_LEVEL[math.clamp(level, 1, 8)] or 20
+				local endAt = os.clock() + respawnSeconds
+
+				task.spawn(function()
+					while os.clock() < endAt do
+						if not (player and player.Parent) then
+							soldierRespawning[player] = soldierRespawning[player] or {}
+							soldierRespawning[player][tostring(slotName)] = nil
+							return
+						end
+						local left = math.max(0, math.ceil(endAt - os.clock()))
+						setRespawnTimerLabel(player, leaderName, tostring(slotName), "Respawn in " .. left .. "s")
+						task.wait(0.5)
+					end
+
+					setRespawnTimerLabel(player, leaderName, tostring(slotName), "")
+
+					soldierRespawning[player] = soldierRespawning[player] or {}
+					soldierRespawning[player][tostring(slotName)] = nil
+
+					if player and player.Parent then
+						local stillOwned = false
+						for _, item in ipairs(getPlayerOwnedLeaderSlots(player)) do
+							if item.SlotName == tostring(slotName) and item.LeaderName == leaderName then
+								stillOwned = true; break
+							end
+						end
+						if stillOwned then
+							if not playerSoldiers[player] then playerSoldiers[player] = {} end
+							local newSoldier = spawnSoldierForPlayer(player, leaderName, slotName)
+							playerSoldiers[player][tostring(slotName)] = newSoldier
+						end
+					end
+				end)
+			end)
+		end
+	end
+
+	-- ✅ USER FIX 4: When THIS soldier's humanoid takes damage, immediately mark combat
+	-- hostility between its owner and the attacker so retaliation fires correctly.
+	-- This is the key fix: without this, a soldier that gets punched had no way to know
+	-- WHO hit it (there's no creator tag on the humanoid), so isHostile() returned false
+	-- and the soldier just stood there and took damage without fighting back.
+	do
+		local hum = clone:FindFirstChildOfClass("Humanoid")
+		if hum then
+			local lastHealth = hum.MaxHealth
+			hum.HealthChanged:Connect(function(hp)
+				if hp < lastHealth and clone and clone.Parent then
+					-- Try to find who hit us: look for the nearest enemy soldier or player
+					local myPos = clone:GetPivot().Position
+
+					-- Check for nearby enemy soldiers first
+					local bestAttackerOwner = nil
+					local bestDist = FALLBACK_NEAR_ATTACKER_RADIUS
+
+					for _, m in ipairs(conquestNpcsFolder:GetChildren()) do
+						if m:IsA("Model") and m ~= clone then
+							local ownerAttr = m:GetAttribute("OwnerName")
+							if ownerAttr and ownerAttr ~= "" and ownerAttr ~= player.Name then
+								local hrp2 = m:FindFirstChild("HumanoidRootPart") or m.PrimaryPart
+								local hum2 = m:FindFirstChildOfClass("Humanoid")
+								if hrp2 and hum2 and hum2.Health > 0 then
+									local d = distXZ(myPos, hrp2.Position)
+									if d < bestDist then
+										bestDist = d
+										bestAttackerOwner = ownerAttr
+									end
+								end
+							end
+						end
+					end
+
+					if bestAttackerOwner then
+						-- Set hostility between both owners so BOTH sides' soldiers retaliate
+						setHostileCombat(player.Name, bestAttackerOwner, HOSTILE_COMBAT_DURATION)
+					else
+						-- Fallback: check for nearby enemy players
+						for _, p2 in ipairs(Players:GetPlayers()) do
+							if p2 ~= player then
+								local ch2 = p2.Character
+								local hrp2 = ch2 and ch2:FindFirstChild("HumanoidRootPart")
+								local hum2 = ch2 and ch2:FindFirstChildOfClass("Humanoid")
+								if hrp2 and hum2 and hum2.Health > 0 then
+									local d = distXZ(myPos, hrp2.Position)
+									if d < bestDist then
+										bestDist = d
+										bestAttackerOwner = p2.Name
+									end
+								end
+							end
+						end
+						if bestAttackerOwner then
+							setHostileCombat(player.Name, bestAttackerOwner, HOSTILE_COMBAT_DURATION)
+						end
+					end
+				end
+				lastHealth = hp
+			end)
+		end
+	end
+
+	task.spawn(function()
+		local wanderTarget = nil
+		local claimingSquare = nil
+		local reservedSquare = nil
+		local soldierId = player.Name .. "_" .. tostring(slotName)
+
+		local lastPunchTime = 0
+		local punching = false
+
+		local defendPauseUntil = 0
+		local followPauseUntil = 0
+
+		local lastPos2D = nil
+		local stuckAccum = 0
+		local lastMode = nil
+
+		local conquerTargetSquare = nil
+
+		-- chase memory
+		local chaseInfo = nil
+
+		local function releaseReservation()
+			if reservedSquare and squareReservations[reservedSquare] == soldierId then
+				squareReservations[reservedSquare] = nil
+			end
+			reservedSquare = nil
+		end
+
+		local function reserveSquare(sq)
+			if reservedSquare == sq then return end
+			releaseReservation()
+			squareReservations[sq] = soldierId
+			reservedSquare = sq
+		end
+
+		local function resetModeState()
+			releaseReservation()
+			claimingSquare = nil
+			wanderTarget = nil
+			defendPauseUntil = 0
+			followPauseUntil = 0
+			stuckAccum = 0
+			lastPos2D = nil
+			punching = false
+			chaseInfo = nil
+			conquerTargetSquare = nil
+			clone:SetAttribute("IsAttacking", false)
+			if animState then animState:SetMode("idle") end
+			setModesIcons(iconAttackObj, iconDefendObj, false, false)
+		end
+
+		local function updateStuck(intendedMoving, currentPos, dt)
+			local cur2D = Vector3.new(currentPos.X, 0, currentPos.Z)
+			if lastPos2D then
+				local moved = (cur2D - lastPos2D).Magnitude
+				if intendedMoving and moved < STUCK_MIN_MOVE then
+					stuckAccum += dt
+				else
+					stuckAccum = 0
+				end
+				if stuckAccum > STUCK_TIME then
+					stuckAccum = 0
+					wanderTarget = nil
+					defendPauseUntil = 0
+					followPauseUntil = 0
+					conquerTargetSquare = nil
+					local nudge = Vector3.new(math.random(-2,2), 0.6, math.random(-2,2))
+					clone:PivotTo(CFrame.new(currentPos + nudge))
+				end
+			end
+			lastPos2D = cur2D
+		end
+
+		local function validTarget(t)
+			return t and t.hrp and t.hrp.Parent and t.humanoid and t.humanoid.Parent and t.humanoid.Health > 0
+		end
+
+		local function refreshChaseFromTarget(t)
+			if not validTarget(t) then return end
+			chaseInfo = {
+				kind=t.kind, enemyName=t.enemyName, hrp=t.hrp, humanoid=t.humanoid,
+				untilTime=os.clock()+CHASE_MEMORY_SECONDS
+			}
+		end
+
+		local function getChaseTargetOrNil()
+			if not chaseInfo then return nil end
+			if os.clock() > (chaseInfo.untilTime or 0) then chaseInfo=nil; return nil end
+			if not validTarget(chaseInfo) then chaseInfo=nil; return nil end
+			return chaseInfo
+		end
+
+		local function getEnemyTarget(currentPos, requireHostile, preferredName, allowSoldiers, soldiersMustBeAttacking)
+			local function isAllowedEnemy(enemyName)
+				if not enemyName or enemyName=="" or enemyName==player.Name then return false end
+				if requireHostile then return isHostile(player.Name, enemyName) end
+				return true
+			end
+
+			if allowSoldiers then
+				local enemyPlayerNearby = {}
+				for _, plr2 in ipairs(Players:GetPlayers()) do
+					if plr2 ~= player and isAllowedEnemy(plr2.Name) then
+						local ch = plr2.Character
+						local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
+						local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+						if hrp and hum and hum.Health > 0 then
+							if distXZ(currentPos, hrp.Position) <= stats.AggroRadius then
+								enemyPlayerNearby[plr2.Name] = true
+							end
+						end
+					end
+				end
+
+				local bestS, bestSDist = nil, math.huge
+				for _, m in ipairs(conquestNpcsFolder:GetChildren()) do
+					if m:IsA("Model") and m ~= clone then
+						local owner = m:GetAttribute("OwnerName")
+						if owner and owner~="" and owner~=player.Name and isAllowedEnemy(owner) then
+							local soldierOk = (not soldiersMustBeAttacking)
+								or (m:GetAttribute("IsAttacking") == true)
+								or (enemyPlayerNearby[owner] == true)
+							if soldierOk then
+								local hum = m:FindFirstChildOfClass("Humanoid")
+								local hrp = m:FindFirstChild("HumanoidRootPart") or m.PrimaryPart
+								if hum and hrp and hum.Health > 0 then
+									local d = distXZ(currentPos, hrp.Position)
+									if d <= stats.AggroRadius and d < bestSDist then
+										bestSDist = d
+										bestS = { kind="Soldier", enemyName=owner, hrp=hrp, humanoid=hum }
+									end
+								end
+							end
+						end
+					end
+				end
+				if bestS then return bestS end
+			end
+
+			-- preferred enemy player
+			if preferredName and isAllowedEnemy(preferredName) then
+				local targetPlr = Players:FindFirstChild(preferredName)
+				if targetPlr and targetPlr ~= player then
+					local ch = targetPlr.Character
+					local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
+					local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+					if hrp and hum and hum.Health > 0 then
+						local d = distXZ(currentPos, hrp.Position)
+						if d <= stats.AggroRadius then
+							return { kind="Player", enemyName=preferredName, hrp=hrp, humanoid=hum }
+						end
+					end
+				end
+			end
+
+			-- attack target settings
+			local settings = playerAttackTarget[player] or { Pattern="Default", TargetName=nil }
+			if settings.Pattern == "Specific" and settings.TargetName then
+				local name = settings.TargetName
+				if isAllowedEnemy(name) then
+					local targetPlr = Players:FindFirstChild(name)
+					if targetPlr and targetPlr ~= player then
+						local ch = targetPlr.Character
+						local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
+						local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+						if hrp and hum and hum.Health > 0 then
+							local d = distXZ(currentPos, hrp.Position)
+							if d <= stats.AggroRadius then
+								return { kind="Player", enemyName=name, hrp=hrp, humanoid=hum }
+							end
+						end
+					end
+				end
+				return nil
+			end
+
+			-- nearest enemy player
+			local bestPlr, bestHrp, bestHum, bestDist = nil, nil, nil, math.huge
+			for _, plr2 in ipairs(Players:GetPlayers()) do
+				if plr2 ~= player and isAllowedEnemy(plr2.Name) then
+					local ch = plr2.Character
+					local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
+					local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+					if hrp and hum and hum.Health > 0 then
+						local d = distXZ(currentPos, hrp.Position)
+						if d < stats.AggroRadius and d < bestDist then
+							bestDist = d; bestPlr = plr2; bestHrp = hrp; bestHum = hum
+						end
+					end
+				end
+			end
+			if bestPlr then return { kind="Player", enemyName=bestPlr.Name, hrp=bestHrp, humanoid=bestHum } end
+			return nil
+		end
+
+		local function doPunch(targetInfo)
+			if punching then return end
+			local now2 = os.clock()
+			if now2 - lastPunchTime < stats.AttackCooldown then return end
+			if not clone or not clone.Parent then return end
+			if not targetInfo or not targetInfo.hrp or not targetInfo.hrp.Parent then return end
+			if not targetInfo.humanoid or targetInfo.humanoid.Health <= 0 then return end
+			local myPos = clone:GetPivot().Position
+			local d2 = distXZ(myPos, targetInfo.hrp.Position)
+			if d2 > stats.PunchRange then return end
+			if ATTACK_FACE_ASSIST then faceTarget(clone, myPos, targetInfo.hrp.Position) end
+			lastPunchTime = now2
+			punching = true
+			if animState then animState:SetMode("punch") end
+			task.delay(PUNCH_WINDUP, function()
+				if not clone or not clone.Parent then punching=false; return end
+				if not targetInfo or not targetInfo.hrp or not targetInfo.hrp.Parent then punching=false; return end
+				if not targetInfo.humanoid or targetInfo.humanoid.Health <= 0 then punching=false; return end
+				local myPos2 = clone:GetPivot().Position
+				local d2b = distXZ(myPos2, targetInfo.hrp.Position)
+				if d2b <= stats.PunchRange and isTargetInFront(clone:GetPivot(), targetInfo.hrp.Position) then
+					pcall(function() targetInfo.humanoid:TakeDamage(stats.AttackDamage) end)
+					if targetInfo.kind == "Player" and targetInfo.enemyName then
+						setHostileCombat(player.Name, targetInfo.enemyName, HOSTILE_COMBAT_DURATION)
+					end
+				end
+				task.delay(PUNCH_RECOVER, function() punching = false end)
+			end)
+		end
+
+		while clone and clone.Parent do
+			local dt = RunService.Heartbeat:Wait()
+			local currentPos = clone:GetPivot().Position
+			local now = os.clock()
+
+			if currentPos.Y < SOLDIER_FALL_Y_KILL then
+				releaseReservation()
+				if clone and clone.Parent then clone:Destroy() end
+				return
+			end
+
+			local stillOwned = false
+			for _, item in ipairs(getPlayerOwnedLeaderSlots(player)) do
+				if item.SlotName == slotName and item.LeaderName == leaderName then
+					stillOwned = true; break
+				end
+			end
+			if not stillOwned then
+				releaseReservation()
+				if clone and clone.Parent then clone:Destroy() end
+				return
+			end
+
+			local mode = (playerSoldierModes[player] and playerSoldierModes[player][tostring(slotName)]) or "Conquer"
+			clone:SetAttribute("Mode", mode)
+
+			if mode ~= lastMode then
+				resetModeState()
+				lastMode = mode
+			end
+
+			local intendedMoving = false
+			local isClaiming = false
+			local attackLocked = false
+
+			-- ✅ USER FIX 5: Only use follow-assist if the soldier is within FOLLOW_ASSIST_PROXIMITY
+			-- of the player. This prevents distant soldiers from chain-aggroing.
+			local assistTargetName = nil
+			local focus = followFocusUntil[player.Name]
+			if focus and focus.untilTime and now <= focus.untilTime then
+				-- Extra proximity gate: only assist if we are close enough to our owner
+				if mode == "Follow" then
+					local ch = player.Character
+					local ownerHRP = ch and ch:FindFirstChild("HumanoidRootPart")
+					if ownerHRP and distXZ(currentPos, ownerHRP.Position) <= FOLLOW_ASSIST_PROXIMITY then
+						assistTargetName = focus.targetName
+					end
+					-- For Defend/Conquer modes the assist target is not proximity-gated
+					-- because those soldiers are already range-limited by their own aggro radius
+				else
+					assistTargetName = focus.targetName
+				end
+			end
+
+			-- ────────────────────────────────────────────────────
+			if mode == "Defend" then
+				-- ────────────────────────────────────────────────────
+				releaseReservation()
+				claimingSquare = nil
+
+				local sp = getPlayerSpawnPart(player)
+				local basePos = sp and sp.Position or currentPos
+
+				local t = getEnemyTarget(currentPos, true, nil, true, true)
+				if not t then
+					local ct = getChaseTargetOrNil()
+					if ct then
+						local d2 = distXZ(currentPos, ct.hrp.Position)
+						if d2 <= (stats.AggroRadius + CHASE_MAX_EXTRA_DIST) then t = ct else chaseInfo = nil end
+					end
+				end
+				if t and distXZ(t.hrp.Position, basePos) > DEFEND_CHASE_LEASH then
+					t = nil; chaseInfo = nil
+				end
+
+				if t and t.hrp and t.humanoid then
+					refreshChaseFromTarget(t)
+					attackLocked = true
+					local d2 = distXZ(currentPos, t.hrp.Position)
+					if d2 > stats.PunchRange then
+						intendedMoving = stepTowardPivot(clone, currentPos, t.hrp.Position, dt, stats.Speed)
+					else
+						doPunch(t)
+					end
+				else
+					if distXZ(currentPos, basePos) > DEFEND_MAX_DISTANCE then
+						defendPauseUntil = 0; wanderTarget = nil
+						intendedMoving = stepTowardPivot(clone, currentPos, basePos, dt, stats.Speed)
+					else
+						if now < defendPauseUntil then
+							intendedMoving = false
+						else
+							if not wanderTarget then
+								local ang = math.random() * math.pi * 2
+								local radius = math.random(DEFEND_RING_MIN, DEFEND_RING_MAX)
+								wanderTarget = Vector3.new(
+									basePos.X + math.cos(ang)*radius, currentPos.Y, basePos.Z + math.sin(ang)*radius)
+							end
+							if distXZ(currentPos, wanderTarget) <= DEFEND_ARRIVE_RADIUS then
+								intendedMoving = false
+								defendPauseUntil = now + DEFEND_IDLE_TIME
+								wanderTarget = nil
+							else
+								intendedMoving = stepTowardPivot(clone, currentPos, wanderTarget, dt, stats.Speed)
+							end
+						end
+					end
+				end
+
+				-- ────────────────────────────────────────────────────
+			elseif mode == "Follow" then
+				-- ────────────────────────────────────────────────────
+				releaseReservation()
+				claimingSquare = nil
+
+				local ch = player.Character
+				local ownerHRP = ch and ch:FindFirstChild("HumanoidRootPart")
+
+				-- ✅ USER FIX 4 + FIX 5 combined for Follow mode:
+				-- The soldier checks for hostiles using requireHostile=true.
+				-- Hostility is now properly set by the HealthChanged watcher above,
+				-- so when a defender hits this soldier, isHostile() returns true
+				-- and the soldier will correctly retaliate.
+				-- We also pass assistTargetName (already proximity-gated by FIX 5).
+				local t = nil
+				if assistTargetName and isHostile(player.Name, assistTargetName) then
+					t = getEnemyTarget(currentPos, true, assistTargetName, true, true)
+				end
+
+				-- Also check for ANY hostile in aggro range without requiring a specific
+				-- assist target — this is the key change: follow soldiers now actively
+				-- scan for hostiles rather than only reacting to the focusTarget.
+				if not t then
+					t = getEnemyTarget(currentPos, true, nil, true, true)
+				end
+
+				if not t then
+					local ct = getChaseTargetOrNil()
+					if ct then
+						local d2 = distXZ(currentPos, ct.hrp.Position)
+						if d2 <= (stats.AggroRadius + CHASE_MAX_EXTRA_DIST) then t = ct else chaseInfo = nil end
+					end
+				end
+				if t and ownerHRP and distXZ(t.hrp.Position, ownerHRP.Position) > FOLLOW_CHASE_LEASH then
+					t = nil; chaseInfo = nil
+				end
+
+				if t and t.hrp and t.humanoid then
+					refreshChaseFromTarget(t)
+					attackLocked = true
+					local d2 = distXZ(currentPos, t.hrp.Position)
+					if d2 > stats.PunchRange then
+						intendedMoving = stepTowardPivot(clone, currentPos, t.hrp.Position, dt, stats.Speed)
+					else
+						doPunch(t)
+					end
+				end
+
+				if not attackLocked then
+					if ownerHRP then
+						local ownerPos = ownerHRP.Position
+						local ownerVel = ownerHRP.AssemblyLinearVelocity or Vector3.zero
+						local predicted = ownerPos + Vector3.new(ownerVel.X,0,ownerVel.Z)*FOLLOW_PREDICT_SEC
+						local d = distXZ(currentPos, predicted)
+						if d > FOLLOW_TOO_FAR then
+							followPauseUntil = 0; wanderTarget = nil
+							local ang = (tostring(slotName):byte(6) or math.random(1,255)) * 0.07
+							local ring = predicted + Vector3.new(math.cos(ang)*FOLLOW_COMFORT_MAX, 0, math.sin(ang)*FOLLOW_COMFORT_MAX)
+							intendedMoving = stepTowardPivot(clone, currentPos, ring, dt, stats.Speed)
+						else
+							if now < followPauseUntil then
+								intendedMoving = false
+							else
+								if not wanderTarget then
+									local ang = math.random() * math.pi * 2
+									local radius = math.random(FOLLOW_PATROL_MIN, FOLLOW_PATROL_MAX)
+									wanderTarget = Vector3.new(
+										predicted.X+math.cos(ang)*radius, currentPos.Y, predicted.Z+math.sin(ang)*radius)
+								end
+								if distXZ(currentPos, wanderTarget) < 3.0 then
+									followPauseUntil = now + (math.random()*(FOLLOW_MAX_PAUSE-FOLLOW_MIN_PAUSE)+FOLLOW_MIN_PAUSE)
+									wanderTarget = nil; intendedMoving = false
+								else
+									if d < FOLLOW_COMFORT_MIN then
+										local away = Vector3.new(currentPos.X,0,currentPos.Z) - Vector3.new(predicted.X,0,predicted.Z)
+										if away.Magnitude < 0.1 then away = Vector3.new(1,0,0) end
+										local pushPos = Vector3.new(predicted.X,currentPos.Y,predicted.Z) + away.Unit*FOLLOW_COMFORT_MIN
+										intendedMoving = stepTowardPivot(clone, currentPos, pushPos, dt, stats.Speed)
+									else
+										intendedMoving = stepTowardPivot(clone, currentPos, wanderTarget, dt, stats.Speed)
+									end
+								end
+							end
+						end
+					end
+				end
+
+				-- ────────────────────────────────────────────────────
+			elseif mode == "Attack" then
+				-- ────────────────────────────────────────────────────
+				releaseReservation()
+				claimingSquare = nil
+
+				local t = getEnemyTarget(currentPos, false, nil, true, false)
+				if not t then
+					local ct = getChaseTargetOrNil()
+					if ct then
+						local d2 = distXZ(currentPos, ct.hrp.Position)
+						if d2 <= (stats.AggroRadius + CHASE_MAX_EXTRA_DIST) then t = ct else chaseInfo = nil end
+					end
+				end
+
+				if t and t.hrp and t.humanoid then
+					refreshChaseFromTarget(t)
+					attackLocked = true
+					local d2 = distXZ(currentPos, t.hrp.Position)
+					if d2 > stats.PunchRange then
+						intendedMoving = stepTowardPivot(clone, currentPos, t.hrp.Position, dt, stats.Speed)
+					else
+						doPunch(t)
+					end
+				else
+					if (not wanderTarget) or distXZ(currentPos, wanderTarget) < 4 then
+						if #squareList > 0 then
+							local sq = squareList[math.random(1, #squareList)]
+							wanderTarget = sq.Position + Vector3.new(math.random(-10,10), 0, math.random(-10,10))
+						else
+							wanderTarget = currentPos + Vector3.new(math.random(-70,70), 0, math.random(-70,70))
+						end
+					end
+					intendedMoving = stepTowardPivot(clone, currentPos, wanderTarget, dt, stats.Speed)
+				end
+
+				-- ────────────────────────────────────────────────────
+			else -- Conquer
+				-- ────────────────────────────────────────────────────
+				local t = getEnemyTarget(currentPos, true, assistTargetName, true, true)
+
+				if not t then
+					local ct = getChaseTargetOrNil()
+					if ct then
+						local d2 = distXZ(currentPos, ct.hrp.Position)
+						if d2 <= (stats.AggroRadius + CHASE_MAX_EXTRA_DIST) then t = ct else chaseInfo = nil end
+					end
+				end
+
+				if t and t.hrp and t.humanoid then
+					refreshChaseFromTarget(t)
+					attackLocked = true
+					local d2 = distXZ(currentPos, t.hrp.Position)
+					if d2 > stats.PunchRange then
+						intendedMoving = stepTowardPivot(clone, currentPos, t.hrp.Position, dt, stats.Speed)
+					else
+						doPunch(t)
+					end
+				end
+
+				if not attackLocked then
+					local sp = getPlayerSpawnPart(player)
+					local basePos = sp and sp.Position or currentPos
+
+					local needNewTarget = (not conquerTargetSquare)
+						or (squareOwners[conquerTargetSquare] == player.Name)
+						or (squareReservations[conquerTargetSquare] ~= nil
+							and squareReservations[conquerTargetSquare] ~= soldierId)
+
+					if needNewTarget then
+						conquerTargetSquare = findConquerTargetWithSpread(currentPos, player.Name, soldierId, basePos)
+					end
+
+					local nearSq = conquerTargetSquare
+
+					if nearSq then
+						local nearDist2D = distXZ(currentPos, nearSq.Position)
+						local target = Vector3.new(nearSq.Position.X, currentPos.Y, nearSq.Position.Z)
+
+						if nearDist2D <= CONQUEST_RADIUS then
+							reserveSquare(nearSq)
+							claimingSquare = nearSq
+
+							if nearDist2D > 0.45 then
+								intendedMoving = stepTowardPivot(clone, currentPos, target, dt, stats.Speed)
+								if conquestTimers[nearSq] and conquestTimers[nearSq].player == player then
+									conquestTimers[nearSq] = nil
+								end
+							else
+								local tmr = conquestTimers[nearSq]
+								if tmr and tmr.player == player then
+									tmr.elapsed += dt
+								else
+									conquestTimers[nearSq] = { player=player, elapsed=0 }
+									tmr = conquestTimers[nearSq]
+								end
+
+								isClaiming = true
+
+								if tmr.elapsed >= stats.ConquerTime then
+									setSquareOwner(nearSq, player, leaderName)
+									conquestTimers[nearSq] = nil
+									isClaiming = false
+									releaseReservation()
+									claimingSquare = nil
+									conquerTargetSquare = nil
+								end
+							end
+						else
+							if claimingSquare and conquestTimers[claimingSquare] and conquestTimers[claimingSquare].player == player then
+								conquestTimers[claimingSquare] = nil
+							end
+							releaseReservation()
+							claimingSquare = nil
+							intendedMoving = stepTowardPivot(clone, currentPos, target, dt, stats.Speed)
+						end
+					else
+						releaseReservation()
+						claimingSquare = nil
+						local anchorSq = findNearestOwnedOrBaseAdjSquare(currentPos, player.Name)
+						if anchorSq then
+							local target = Vector3.new(anchorSq.Position.X, currentPos.Y, anchorSq.Position.Z)
+							intendedMoving = stepTowardPivot(clone, currentPos, target, dt, stats.Speed)
+						else
+							local spFb = getPlayerSpawnPart(player)
+							local basePosF = spFb and spFb.Position or currentPos
+							intendedMoving = stepTowardPivot(clone, currentPos, basePosF, dt, stats.Speed)
+						end
+					end
+				end
+			end
+
+			-- icons
+			if attackLocked then
+				setModesIcons(iconAttackObj, iconDefendObj, true, false)
+			elseif mode == "Defend" then
+				setModesIcons(iconAttackObj, iconDefendObj, false, true)
+			else
+				setModesIcons(iconAttackObj, iconDefendObj, false, false)
+			end
+
+			clone:SetAttribute("IsAttacking", attackLocked == true)
+
+			if animState then
+				if punching then
+				elseif isClaiming and animState.conquerTrack then
+					animState:SetMode("conquer")
+				elseif attackLocked then
+					animState:SetMode("alert")
+				elseif intendedMoving then
+					animState:SetMode("walk")
+				else
+					animState:SetMode("idle")
+				end
+			end
+
+			updateStuck(intendedMoving, currentPos, dt)
+		end
+
+		releaseReservation()
+	end)
+
+	return clone
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- SOLDIER MANAGER
+-- ─────────────────────────────────────────────────────────────────────────────
+local function syncSoldiersForPlayer(player)
+	if not playerSoldiers[player] then playerSoldiers[player] = {} end
+	ensurePlayerModeTable(player)
+
+	local ownedSlots = getPlayerOwnedLeaderSlots(player)
+	local desired = {}
+	for _, item in ipairs(ownedSlots) do
+		desired[item.SlotName] = item.LeaderName
+	end
+
+	for slotName, soldierModel in pairs(playerSoldiers[player]) do
+		if not desired[slotName] then
+			if soldierModel and soldierModel.Parent then soldierModel:Destroy() end
+			playerSoldiers[player][slotName] = nil
+			if playerSoldierModes[player] then playerSoldierModes[player][slotName] = nil end
+		end
+	end
+
+	for slotName, leaderName in pairs(desired) do
+		local existing = playerSoldiers[player][slotName]
+		local isRespawning = soldierRespawning[player] and soldierRespawning[player][tostring(slotName)]
+		if (not existing or not existing.Parent) and not isRespawning then
+			playerSoldiers[player][slotName] = spawnSoldierForPlayer(player, leaderName, slotName)
+		end
+		playerSoldierModes[player][slotName] = playerSoldierModes[player][slotName] or "Conquer"
+	end
+end
+
+local function startSoldierManagerForPlayer(player)
+	if soldierManagerStarted[player] then return end
+	soldierManagerStarted[player] = true
+
+	playerSoldiers[player] = {}
+	ensurePlayerModeTable(player)
+
+	local v  = player:WaitForChild("Values", 20)
+	if not v then return end
+	local sp = v:WaitForChild("SavedPlaces", 20)
+	if not sp then return end
+
+	local function watchSlot(slot)
+		if slot:IsA("IntValue") then
+			slot:GetAttributeChangedSignal("LeaderName"):Connect(function()
+				task.wait(0.05)
+				syncSoldiersForPlayer(player)
+			end)
+		end
+		slot:GetPropertyChangedSignal("Value"):Connect(function()
+			task.wait(0.05)
+			syncSoldiersForPlayer(player)
+		end)
+	end
+
+	for _, slot in ipairs(sp:GetChildren()) do
+		if slot.Name:match("^Place%d+$") and (slot:IsA("StringValue") or slot:IsA("IntValue")) then
+			watchSlot(slot)
+		end
+	end
+
+	sp.ChildAdded:Connect(function(slot)
+		if slot.Name:match("^Place%d+$") and (slot:IsA("StringValue") or slot:IsA("IntValue")) then
+			watchSlot(slot)
+		end
+	end)
+
+	syncSoldiersForPlayer(player)
+
+	task.spawn(function()
+		while player and player.Parent do
+			task.wait(SOLDIER_RESPAWN_INTERVAL)
+			if player and player.Parent then
+				syncSoldiersForPlayer(player)
+			end
+		end
+	end)
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- LIVE FLAG WATCHER
+-- ─────────────────────────────────────────────────────────────────────────────
+local function startCountryWatcher(player)
+	task.spawn(function()
+		local v = player:WaitForChild("Values", 20)
+		if not v then return end
+		local countryVal = v:WaitForChild("CountryImageId", 20)
+		if not countryVal then return end
+		refreshConqueredSquaresForPlayer(player)
+		countryVal:GetPropertyChangedSignal("Value"):Connect(function()
+			task.wait(0.05)
+			if player and player.Parent then refreshConqueredSquaresForPlayer(player) end
+		end)
+	end)
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- PLAYER CONNECTIONS
+-- ─────────────────────────────────────────────────────────────────────────────
+Players.PlayerAdded:Connect(function(player)
+	task.wait(2)
+	ensurePlayerModeTable(player)
+	startSoldierManagerForPlayer(player)
+	startCountryWatcher(player)
+	startPlayerDamageWatcher(player)
+end)
+
+Players.PlayerRemoving:Connect(function(player)
+	playerSpawnCache[player]          = nil
+	soldierManagerStarted[player]     = nil
+	playerAttackTarget[player]        = nil
+	playerSoldierModes[player]        = nil
+	baseHelpCooldownUntil[player.Name]= nil
+	followFocusUntil[player.Name]     = nil
+	hostileCombatUntil[player.Name]   = nil
+	hostileTouchUntil[player.Name]    = nil
+	soldierRespawning[player]         = nil
+
+	if playerSoldiers[player] then
+		for _, soldierModel in pairs(playerSoldiers[player]) do
+			if soldierModel and soldierModel.Parent then soldierModel:Destroy() end
+		end
+		playerSoldiers[player] = nil
+	end
+
+	for sq, id in pairs(squareReservations) do
+		if typeof(id)=="string" and id:sub(1, #player.Name)==player.Name then
+			squareReservations[sq] = nil
+		end
+	end
+
+	for _, sq in ipairs(squareList) do
+		if squareOwners[sq] == player.Name then
+			squareOwners[sq] = nil
+			clearSquareVisuals(sq)
+		end
+	end
+end)
+
+for _, player in pairs(Players:GetPlayers()) do
+	task.spawn(function()
+		task.wait(1)
+		ensurePlayerModeTable(player)
+		startSoldierManagerForPlayer(player)
+		startCountryWatcher(player)
+		startPlayerDamageWatcher(player)
+	end)
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- GUARANTEE TIMERS
+-- ─────────────────────────────────────────────────────────────────────────────
+local wall = workspace:FindFirstChild("RoadForNpcs") and workspace.RoadForNpcs:FindFirstChild("Wall")
+local legendaryLabel, mythicLabel
+if wall then
+	local bb = wall:FindFirstChild("SurfaceGui")
+	if bb then
+		legendaryLabel = bb:FindFirstChild("LegendaryLabel")
+		mythicLabel    = bb:FindFirstChild("MythicLabel")
+	end
+end
+
+local function formatTime(seconds)
+	return string.format("%02d:%02d", math.floor(seconds/60), seconds%60)
+end
+
+local function updateWallTimers()
+	if legendaryCountdown ~= lastLegendaryCountdown and legendaryLabel then
+		legendaryLabel.Text = [[Guaranteed <font color="rgb(255, 255, 0)">Legendary</font> in ]] .. formatTime(legendaryCountdown)
+		lastLegendaryCountdown = legendaryCountdown
+	end
+	if mythicCountdown ~= lastMythicCountdown and mythicLabel then
+		mythicLabel.Text = [[Guaranteed <font color="rgb(255, 0, 0)">Mythic</font> in ]] .. formatTime(mythicCountdown)
+		lastMythicCountdown = mythicCountdown
+	end
+end
+
+task.spawn(function()
+	while true do
+		task.wait(1)
+		legendaryCountdown = math.max(0, legendaryCountdown - 1)
+		mythicCountdown    = math.max(0, mythicCountdown - 1)
+		updateWallTimers()
+	end
+end)
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- MAIN LOOPS
+-- ─────────────────────────────────────────────────────────────────────────────
+task.spawn(function()
+	while true do
+		spawnRegularWildNpc()
+		task.wait(NPC_SPAWN_INTERVAL)
+	end
+end)
+
+task.spawn(function()
+	while true do
+		task.wait(BASE_HELP_CHECK_INTERVAL)
+		local owners = collectBaseOwners()
+		for _, ownerName in ipairs(owners) do
+			trySpawnBaseHelpForOwner(ownerName)
+		end
+	end
+end)
+
+--[[
+✅ OPTIONAL BEST PRACTICE (STILL RECOMMENDED)
+In your weapons when a hit is confirmed, fire:
+ReplicatedStorage:WaitForChild("CombatTagEvent"):Fire(attackerPlayer.Name, victimPlayer.Name)
+]]
