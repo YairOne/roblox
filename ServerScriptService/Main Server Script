@@ -97,16 +97,6 @@ local PUNCH_WINDUP          = 0.16
 local PUNCH_RECOVER         = 0.10
 local ATTACK_FOV_DEGREES    = 120
 local ATTACK_FACE_ASSIST    = true
-local COMBAT_HOLD_RADIUS    = 6.5
-local COMBAT_STRAFE_STEP    = 2.6
-
--- combat mobility (adds 4-direction dash: forward/right/left/backward)
-local DASH_FORWARD_DIST     = 8.0
-local DASH_SIDE_DIST        = 7.0
-local DASH_BACKWARD_DIST    = 6.0
-local DASH_COOLDOWN_MIN     = 1.4
-local DASH_COOLDOWN_MAX     = 2.8
-local DASH_CHANCE_PER_TICK  = 0.18
 
 -- DEFEND
 local DEFEND_RING_MIN       = 12
@@ -1810,7 +1800,6 @@ local function spawnSoldierForPlayer(player, leaderName, slotName)
 
 		local lastPunchTime = 0
 		local punching = false
-		local nextDashAt = os.clock() + math.random()
 
 		local defendPauseUntil = 0
 		local followPauseUntil = 0
@@ -1893,61 +1882,6 @@ local function spawnSoldierForPlayer(player, leaderName, slotName)
 			if os.clock() > (chaseInfo.untilTime or 0) then chaseInfo=nil; return nil end
 			if not validTarget(chaseInfo) then chaseInfo=nil; return nil end
 			return chaseInfo
-		end
-
-		local function getCombatStrafePoint(currentPos, targetPos)
-			local flatDir = Vector3.new(targetPos.X - currentPos.X, 0, targetPos.Z - currentPos.Z)
-			if flatDir.Magnitude < 0.01 then return nil end
-			local side = Vector3.new(-flatDir.Z, 0, flatDir.X)
-			if side.Magnitude < 0.01 then return nil end
-			local sign = (math.random() < 0.5) and -1 or 1
-			return currentPos + side.Unit * (COMBAT_STRAFE_STEP * sign)
-		end
-
-		local function attemptDash(currentPos, targetPos, now, dt)
-			if now < nextDashAt then return false end
-			if math.random() > DASH_CHANCE_PER_TICK then return false end
-
-			local toTarget = Vector3.new(targetPos.X - currentPos.X, 0, targetPos.Z - currentPos.Z)
-			if toTarget.Magnitude < 0.01 then return false end
-
-			local forward = toTarget.Unit
-			local right = Vector3.new(forward.Z, 0, -forward.X)
-
-			local dashOptions = {
-				{dir = forward, dist = DASH_FORWARD_DIST},
-				{dir = right, dist = DASH_SIDE_DIST},
-				{dir = -right, dist = DASH_SIDE_DIST},
-				{dir = -forward, dist = DASH_BACKWARD_DIST},
-			}
-
-			local pick = dashOptions[math.random(1, #dashOptions)]
-			local dashTarget = currentPos + pick.dir * pick.dist
-			stepTowardPivot(clone, currentPos, dashTarget, dt, stats.Speed * 6.5)
-			nextDashAt = now + (math.random() * (DASH_COOLDOWN_MAX - DASH_COOLDOWN_MIN) + DASH_COOLDOWN_MIN)
-			return true
-		end
-
-		local function approachOrHoldCombat(currentPos, targetPos, dt, now)
-			local d2 = distXZ(currentPos, targetPos)
-			if d2 > stats.PunchRange then
-				return stepTowardPivot(clone, currentPos, targetPos, dt, stats.Speed)
-			end
-
-			if d2 <= COMBAT_HOLD_RADIUS then
-				faceTarget(clone, currentPos, targetPos)
-				if attemptDash(currentPos, targetPos, now, dt) then
-					return true
-				end
-				local strafePoint = getCombatStrafePoint(currentPos, targetPos)
-				if strafePoint then
-					return stepTowardPivot(clone, currentPos, strafePoint, dt, stats.Speed * 0.9)
-				end
-				return false
-			end
-
-			faceTarget(clone, currentPos, targetPos)
-			return false
 		end
 
 		local function getEnemyTarget(currentPos, requireHostile, preferredName, allowSoldiers, soldiersMustBeAttacking)
@@ -2161,8 +2095,10 @@ local function spawnSoldierForPlayer(player, leaderName, slotName)
 				if t and t.hrp and t.humanoid then
 					refreshChaseFromTarget(t)
 					attackLocked = true
-					intendedMoving = approachOrHoldCombat(currentPos, t.hrp.Position, dt, now)
-					if distXZ(currentPos, t.hrp.Position) <= stats.PunchRange then
+					local d2 = distXZ(currentPos, t.hrp.Position)
+					if d2 > stats.PunchRange then
+						intendedMoving = stepTowardPivot(clone, currentPos, t.hrp.Position, dt, stats.Speed)
+					else
 						doPunch(t)
 					end
 				else
@@ -2231,8 +2167,10 @@ local function spawnSoldierForPlayer(player, leaderName, slotName)
 				if t and t.hrp and t.humanoid then
 					refreshChaseFromTarget(t)
 					attackLocked = true
-					intendedMoving = approachOrHoldCombat(currentPos, t.hrp.Position, dt, now)
-					if distXZ(currentPos, t.hrp.Position) <= stats.PunchRange then
+					local d2 = distXZ(currentPos, t.hrp.Position)
+					if d2 > stats.PunchRange then
+						intendedMoving = stepTowardPivot(clone, currentPos, t.hrp.Position, dt, stats.Speed)
+					else
 						doPunch(t)
 					end
 				end
@@ -2294,8 +2232,10 @@ local function spawnSoldierForPlayer(player, leaderName, slotName)
 				if t and t.hrp and t.humanoid then
 					refreshChaseFromTarget(t)
 					attackLocked = true
-					intendedMoving = approachOrHoldCombat(currentPos, t.hrp.Position, dt, now)
-					if distXZ(currentPos, t.hrp.Position) <= stats.PunchRange then
+					local d2 = distXZ(currentPos, t.hrp.Position)
+					if d2 > stats.PunchRange then
+						intendedMoving = stepTowardPivot(clone, currentPos, t.hrp.Position, dt, stats.Speed)
+					else
 						doPunch(t)
 					end
 				else
@@ -2326,8 +2266,10 @@ local function spawnSoldierForPlayer(player, leaderName, slotName)
 				if t and t.hrp and t.humanoid then
 					refreshChaseFromTarget(t)
 					attackLocked = true
-					intendedMoving = approachOrHoldCombat(currentPos, t.hrp.Position, dt, now)
-					if distXZ(currentPos, t.hrp.Position) <= stats.PunchRange then
+					local d2 = distXZ(currentPos, t.hrp.Position)
+					if d2 > stats.PunchRange then
+						intendedMoving = stepTowardPivot(clone, currentPos, t.hrp.Position, dt, stats.Speed)
+					else
 						doPunch(t)
 					end
 				end
