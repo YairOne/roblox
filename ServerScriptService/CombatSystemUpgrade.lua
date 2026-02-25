@@ -1,7 +1,17 @@
 -- NpcSquareSystem (combat subsystem upgrade)
--- This file focuses on combat behavior upgrades requested by design:
--- 1) soldiers enter a fighting stance as they close in,
--- 2) soldiers perform short dash steps (forward/back/left/right) while dueling.
+-- This block is designed to be pasted directly inside your main script,
+-- so combat and AI can run from one script only.
+--
+-- Usage inside main script:
+-- 1) Keep this whole block above your soldier update loop.
+-- 2) Create combat data once per soldier clone:
+--      local combatAnim = setupSoldierCombatAnimations(clone)
+-- 3) Replace normal chase movement with:
+--      local moved = updateCloseCombat(clone, combatAnim, target.hrp.Position, dt, stats.Speed)
+--
+-- Optional module compatibility:
+-- If this code is left in a ModuleScript and required, it will still return
+-- the same API table at the bottom.
 
 local function normalizeAnimId(id)
 	if not id then return nil end
@@ -56,7 +66,7 @@ local function loadTrack(animator, animId, looped, priority)
 	return track
 end
 
-local function setupSoldierCombatAnimations(model)
+function setupSoldierCombatAnimations(model)
 	local humanoid = model:FindFirstChildOfClass("Humanoid")
 	if not humanoid then return nil end
 	local animator = humanoid:FindFirstChildOfClass("Animator") or Instance.new("Animator", humanoid)
@@ -138,9 +148,7 @@ local function performDash(model, combatAnim, targetPos, dt, speed)
 	return moveToward(model, myPos, dashTarget, dt, speed * DASH_SPEED_MULT)
 end
 
--- Integration helper:
--- call this when the soldier has an active enemy target.
-local function updateCloseCombat(model, combatAnim, targetPos, dt, speed)
+function updateCloseCombat(model, combatAnim, targetPos, dt, speed)
 	local myPos = model:GetPivot().Position
 	local d = distXZ(myPos, targetPos)
 
@@ -159,14 +167,12 @@ local function updateCloseCombat(model, combatAnim, targetPos, dt, speed)
 	return moveToward(model, myPos, targetPos, dt, speed)
 end
 
--- Example usage in your existing soldier brain loop:
--- local combatAnim = setupSoldierCombatAnimations(clone)
--- ...
--- if target then
---     local moved = updateCloseCombat(clone, combatAnim, target.hrp.Position, dt, stats.Speed)
--- end
-
-return {
+-- ModuleScript compatibility (safe no-op in normal Script usage).
+local api = {
 	setupSoldierCombatAnimations = setupSoldierCombatAnimations,
 	updateCloseCombat = updateCloseCombat,
 }
+
+if script and script:IsA("ModuleScript") then
+	return api
+end
