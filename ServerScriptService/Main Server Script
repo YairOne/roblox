@@ -89,6 +89,11 @@ local SOLDIER_IDLE_ANIM_ID  = "rbxassetid://104270859363826"
 -- ATTACK (BASE)
 local ALERT_ANIM_ID         = "rbxassetid://130829548132060"
 local PUNCH_ANIM_ID         = "rbxassetid://125672823778416"
+local DASH_FORWARD_ANIM_ID  = "rbxassetid://102943968856482"
+local DASH_BACK_ANIM_ID     = "rbxassetid://111268221240880"
+local DASH_LEFT_ANIM_ID     = "rbxassetid://117664259628631"
+local DASH_RIGHT_ANIM_ID    = "rbxassetid://132386621141954"
+local FIGHT_STANCE_ANIM_ID  = "rbxassetid://0"
 local ATTACK_AGGRO_RADIUS   = 55
 local ATTACK_PUNCH_RANGE    = 4.2
 local ATTACK_DAMAGE         = 12
@@ -97,6 +102,12 @@ local PUNCH_WINDUP          = 0.16
 local PUNCH_RECOVER         = 0.10
 local ATTACK_FOV_DEGREES    = 120
 local ATTACK_FACE_ASSIST    = true
+local FIGHT_STANCE_RANGE    = 6.5
+local FIGHT_TOO_CLOSE       = 2.6
+local COMBAT_DASH_DISTANCE  = 8.5
+local COMBAT_DASH_DURATION  = 0.16
+local COMBAT_DASH_COOLDOWN_MIN = 1.2
+local COMBAT_DASH_COOLDOWN_MAX = 2.4
 
 -- DEFEND
 local DEFEND_RING_MIN       = 12
@@ -1399,9 +1410,16 @@ local function setupSoldierAnimations(model)
 	local conquerTrack = loadTrack(CONQUER_ANIM_ID,      true,  Enum.AnimationPriority.Action)
 	local alertTrack   = loadTrack(ALERT_ANIM_ID,        true,  Enum.AnimationPriority.Action)
 	local punchTrack   = loadTrack(PUNCH_ANIM_ID,        false, Enum.AnimationPriority.Action)
+	local stanceTrack  = loadTrack(FIGHT_STANCE_ANIM_ID, true,  Enum.AnimationPriority.Action)
+	local dashForwardTrack = loadTrack(DASH_FORWARD_ANIM_ID, false, Enum.AnimationPriority.Action4)
+	local dashBackTrack    = loadTrack(DASH_BACK_ANIM_ID,    false, Enum.AnimationPriority.Action4)
+	local dashLeftTrack    = loadTrack(DASH_LEFT_ANIM_ID,    false, Enum.AnimationPriority.Action4)
+	local dashRightTrack   = loadTrack(DASH_RIGHT_ANIM_ID,   false, Enum.AnimationPriority.Action4)
 	local state = {
 		idleTrack=idleTrack, walkTrack=walkTrack, conquerTrack=conquerTrack,
-		alertTrack=alertTrack, punchTrack=punchTrack, mode="idle"
+		alertTrack=alertTrack, punchTrack=punchTrack, stanceTrack=stanceTrack,
+		dashForwardTrack=dashForwardTrack, dashBackTrack=dashBackTrack,
+		dashLeftTrack=dashLeftTrack, dashRightTrack=dashRightTrack, mode="idle"
 	}
 	local function safeStop(t, fade)
 		if t and t.IsPlaying then pcall(function() t:Stop(fade or 0.08) end) end
@@ -1416,19 +1434,25 @@ local function setupSoldierAnimations(model)
 		self.mode = newMode
 		if newMode == "punch" then
 			safeStop(self.idleTrack,0.05); safeStop(self.walkTrack,0.05)
-			safeStop(self.conquerTrack,0.05); safeStop(self.alertTrack,0.05)
+			safeStop(self.conquerTrack,0.05); safeStop(self.alertTrack,0.05); safeStop(self.stanceTrack,0.05)
 			if self.punchTrack then pcall(function() self.punchTrack.Looped=false; self.punchTrack:Play(0.05,1,1) end) end
+		elseif newMode == "dash" then
+			safeStop(self.idleTrack,0.03); safeStop(self.walkTrack,0.03); safeStop(self.conquerTrack,0.03)
+			safeStop(self.alertTrack,0.03); safeStop(self.stanceTrack,0.03)
+		elseif newMode == "stance" then
+			safeStop(self.idleTrack,0.08); safeStop(self.walkTrack,0.08); safeStop(self.conquerTrack,0.08); safeStop(self.alertTrack,0.08)
+			if self.stanceTrack then safePlayLoop(self.stanceTrack,0.08) else safePlayLoop(self.alertTrack or self.idleTrack,0.08) end
 		elseif newMode == "alert" then
-			safeStop(self.idleTrack,0.08); safeStop(self.walkTrack,0.08); safeStop(self.conquerTrack,0.08)
+			safeStop(self.idleTrack,0.08); safeStop(self.walkTrack,0.08); safeStop(self.conquerTrack,0.08); safeStop(self.stanceTrack,0.08)
 			if self.alertTrack then safePlayLoop(self.alertTrack,0.08) else safePlayLoop(self.walkTrack,0.08) end
 		elseif newMode == "conquer" then
-			safeStop(self.idleTrack,0.12); safeStop(self.walkTrack,0.12); safeStop(self.alertTrack,0.12)
+			safeStop(self.idleTrack,0.12); safeStop(self.walkTrack,0.12); safeStop(self.alertTrack,0.12); safeStop(self.stanceTrack,0.12)
 			safePlayLoop(self.conquerTrack,0.08)
 		elseif newMode == "walk" then
-			safeStop(self.idleTrack,0.12); safeStop(self.conquerTrack,0.12); safeStop(self.alertTrack,0.12)
+			safeStop(self.idleTrack,0.12); safeStop(self.conquerTrack,0.12); safeStop(self.alertTrack,0.12); safeStop(self.stanceTrack,0.12)
 			safePlayLoop(self.walkTrack,0.08)
 		else
-			safeStop(self.conquerTrack,0.12); safeStop(self.walkTrack,0.12); safeStop(self.alertTrack,0.12)
+			safeStop(self.conquerTrack,0.12); safeStop(self.walkTrack,0.12); safeStop(self.alertTrack,0.12); safeStop(self.stanceTrack,0.12)
 			safePlayLoop(self.idleTrack,0.10)
 		end
 	end
@@ -2016,6 +2040,78 @@ local function spawnSoldierForPlayer(player, leaderName, slotName)
 				task.delay(PUNCH_RECOVER, function() punching = false end)
 			end)
 		end
+		local dashUntil = 0
+		local nextDashAt = 0
+
+		local function playDashTrack(kind)
+			if not animState then return end
+			animState:SetMode("dash")
+			local tr = nil
+			if kind == "Forward" then tr = animState.dashForwardTrack
+			elseif kind == "Back" then tr = animState.dashBackTrack
+			elseif kind == "Left" then tr = animState.dashLeftTrack
+			elseif kind == "Right" then tr = animState.dashRightTrack end
+			if tr then pcall(function() tr.Looped = false; tr:Play(0.04, 1, 1) end) end
+		end
+
+		local function tryCombatDash(targetInfo, now)
+			if now < nextDashAt or now < dashUntil then return false end
+			if punching then return false end
+			if not targetInfo or not targetInfo.hrp or not targetInfo.hrp.Parent then return false end
+			local myCF = clone:GetPivot()
+			local myPos = myCF.Position
+			local toTarget = Vector3.new(targetInfo.hrp.Position.X - myPos.X, 0, targetInfo.hrp.Position.Z - myPos.Z)
+			local d2 = toTarget.Magnitude
+			if d2 < 2 or d2 > (stats.AggroRadius * 0.9) then return false end
+			local forward = Vector3.new(myCF.LookVector.X, 0, myCF.LookVector.Z)
+			if forward.Magnitude < 0.01 then
+				forward = toTarget.Magnitude > 0.01 and toTarget.Unit or Vector3.new(0, 0, -1)
+			else
+				forward = forward.Unit
+			end
+			local right = Vector3.new(forward.Z, 0, -forward.X)
+			if right.Magnitude < 0.01 then right = Vector3.new(1,0,0) else right = right.Unit end
+			local toUnit = toTarget.Unit
+			local frontDot = forward:Dot(toUnit)
+			local sideDot = right:Dot(toUnit)
+
+			local dashDir = nil
+			local dashKind = "Forward"
+			if d2 <= FIGHT_TOO_CLOSE then
+				dashKind = "Back"
+				dashDir = -forward
+			elseif frontDot > 0.75 and d2 > stats.PunchRange + 1.1 then
+				dashKind = "Forward"
+				dashDir = forward
+			elseif math.abs(sideDot) > 0.35 then
+				if sideDot > 0 then
+					dashKind = "Right"
+					dashDir = right
+				else
+					dashKind = "Left"
+					dashDir = -right
+				end
+			else
+				if math.random() < 0.5 then
+					dashKind = "Left"
+					dashDir = -right
+				else
+					dashKind = "Right"
+					dashDir = right
+				end
+			end
+
+			if not dashDir or dashDir.Magnitude < 0.01 then return false end
+			dashDir = dashDir.Unit
+			local dashEnd = myPos + dashDir * COMBAT_DASH_DISTANCE
+			local liftedEnd = Vector3.new(dashEnd.X, myPos.Y + 0.6, dashEnd.Z)
+			clone:PivotTo(CFrame.lookAt(liftedEnd, liftedEnd + forward))
+			playDashTrack(dashKind)
+			dashUntil = now + COMBAT_DASH_DURATION
+			nextDashAt = now + (COMBAT_DASH_COOLDOWN_MIN + math.random() * (COMBAT_DASH_COOLDOWN_MAX - COMBAT_DASH_COOLDOWN_MIN))
+			return true
+		end
+
 
 		while clone and clone.Parent do
 			local dt = RunService.Heartbeat:Wait()
@@ -2051,6 +2147,7 @@ local function spawnSoldierForPlayer(player, leaderName, slotName)
 			local intendedMoving = false
 			local isClaiming = false
 			local attackLocked = false
+			local inFightStance = false
 
 			-- ✅ USER FIX 5: Only use follow-assist if the soldier is within FOLLOW_ASSIST_PROXIMITY
 			-- of the player. This prevents distant soldiers from chain-aggroing.
@@ -2096,10 +2193,19 @@ local function spawnSoldierForPlayer(player, leaderName, slotName)
 					refreshChaseFromTarget(t)
 					attackLocked = true
 					local d2 = distXZ(currentPos, t.hrp.Position)
-					if d2 > stats.PunchRange then
+					if tryCombatDash(t, now) then
+						intendedMoving = false
+					elseif d2 > FIGHT_STANCE_RANGE then
 						intendedMoving = stepTowardPivot(clone, currentPos, t.hrp.Position, dt, stats.Speed)
+					elseif d2 < FIGHT_TOO_CLOSE then
+						local away = Vector3.new(currentPos.X - t.hrp.Position.X, 0, currentPos.Z - t.hrp.Position.Z)
+						if away.Magnitude < 0.05 then away = Vector3.new(1,0,0) end
+						local backoff = currentPos + away.Unit * (stats.PunchRange * 0.65)
+						intendedMoving = stepTowardPivot(clone, currentPos, backoff, dt, stats.Speed)
 					else
-						doPunch(t)
+						inFightStance = true
+						faceTarget(clone, currentPos, t.hrp.Position)
+						if d2 <= stats.PunchRange then doPunch(t) end
 					end
 				else
 					if distXZ(currentPos, basePos) > DEFEND_MAX_DISTANCE then
@@ -2168,10 +2274,19 @@ local function spawnSoldierForPlayer(player, leaderName, slotName)
 					refreshChaseFromTarget(t)
 					attackLocked = true
 					local d2 = distXZ(currentPos, t.hrp.Position)
-					if d2 > stats.PunchRange then
+					if tryCombatDash(t, now) then
+						intendedMoving = false
+					elseif d2 > FIGHT_STANCE_RANGE then
 						intendedMoving = stepTowardPivot(clone, currentPos, t.hrp.Position, dt, stats.Speed)
+					elseif d2 < FIGHT_TOO_CLOSE then
+						local away = Vector3.new(currentPos.X - t.hrp.Position.X, 0, currentPos.Z - t.hrp.Position.Z)
+						if away.Magnitude < 0.05 then away = Vector3.new(1,0,0) end
+						local backoff = currentPos + away.Unit * (stats.PunchRange * 0.65)
+						intendedMoving = stepTowardPivot(clone, currentPos, backoff, dt, stats.Speed)
 					else
-						doPunch(t)
+						inFightStance = true
+						faceTarget(clone, currentPos, t.hrp.Position)
+						if d2 <= stats.PunchRange then doPunch(t) end
 					end
 				end
 
@@ -2233,10 +2348,19 @@ local function spawnSoldierForPlayer(player, leaderName, slotName)
 					refreshChaseFromTarget(t)
 					attackLocked = true
 					local d2 = distXZ(currentPos, t.hrp.Position)
-					if d2 > stats.PunchRange then
+					if tryCombatDash(t, now) then
+						intendedMoving = false
+					elseif d2 > FIGHT_STANCE_RANGE then
 						intendedMoving = stepTowardPivot(clone, currentPos, t.hrp.Position, dt, stats.Speed)
+					elseif d2 < FIGHT_TOO_CLOSE then
+						local away = Vector3.new(currentPos.X - t.hrp.Position.X, 0, currentPos.Z - t.hrp.Position.Z)
+						if away.Magnitude < 0.05 then away = Vector3.new(1,0,0) end
+						local backoff = currentPos + away.Unit * (stats.PunchRange * 0.65)
+						intendedMoving = stepTowardPivot(clone, currentPos, backoff, dt, stats.Speed)
 					else
-						doPunch(t)
+						inFightStance = true
+						faceTarget(clone, currentPos, t.hrp.Position)
+						if d2 <= stats.PunchRange then doPunch(t) end
 					end
 				else
 					if (not wanderTarget) or distXZ(currentPos, wanderTarget) < 4 then
@@ -2267,10 +2391,19 @@ local function spawnSoldierForPlayer(player, leaderName, slotName)
 					refreshChaseFromTarget(t)
 					attackLocked = true
 					local d2 = distXZ(currentPos, t.hrp.Position)
-					if d2 > stats.PunchRange then
+					if tryCombatDash(t, now) then
+						intendedMoving = false
+					elseif d2 > FIGHT_STANCE_RANGE then
 						intendedMoving = stepTowardPivot(clone, currentPos, t.hrp.Position, dt, stats.Speed)
+					elseif d2 < FIGHT_TOO_CLOSE then
+						local away = Vector3.new(currentPos.X - t.hrp.Position.X, 0, currentPos.Z - t.hrp.Position.Z)
+						if away.Magnitude < 0.05 then away = Vector3.new(1,0,0) end
+						local backoff = currentPos + away.Unit * (stats.PunchRange * 0.65)
+						intendedMoving = stepTowardPivot(clone, currentPos, backoff, dt, stats.Speed)
 					else
-						doPunch(t)
+						inFightStance = true
+						faceTarget(clone, currentPos, t.hrp.Position)
+						if d2 <= stats.PunchRange then doPunch(t) end
 					end
 				end
 
@@ -2346,6 +2479,10 @@ local function spawnSoldierForPlayer(player, leaderName, slotName)
 				end
 			end
 
+			if now < dashUntil then
+				intendedMoving = false
+			end
+
 			-- icons
 			if attackLocked then
 				setModesIcons(iconAttackObj, iconDefendObj, true, false)
@@ -2359,8 +2496,12 @@ local function spawnSoldierForPlayer(player, leaderName, slotName)
 
 			if animState then
 				if punching then
+				elseif now < dashUntil then
+					animState:SetMode("dash")
 				elseif isClaiming and animState.conquerTrack then
 					animState:SetMode("conquer")
+				elseif attackLocked and inFightStance then
+					animState:SetMode("stance")
 				elseif attackLocked then
 					animState:SetMode("alert")
 				elseif intendedMoving then
